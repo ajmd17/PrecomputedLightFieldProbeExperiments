@@ -175,6 +175,20 @@ export class TetrahedralProbeSystem extends IndirectLightingSystem {
             sh: zeroSphericalHarmonics(),
           };
 
+    // Offset a few probes to test non-uniform positioning
+    const offsetMap = [
+      { index: 22, delta: [0.5, 0.0, 0.0] },  // ix=2,iy=1,iz=1 — shift right
+      { index: 25, delta: [0.0, 0.5, 0.0] },  // ix=1,iy=2,iz=1 — shift up
+      { index: 37, delta: [0.0, 0.0, 0.5] },  // ix=1,iy=1,iz=2 — shift back
+    ];
+    for (const { index, delta } of offsetMap) {
+      if (index < this.probes.length) {
+        this.probes[index].pos[0] += delta[0];
+        this.probes[index].pos[1] += delta[1];
+        this.probes[index].pos[2] += delta[2];
+      }
+    }
+
     // Build all tetrahedron definitions (6 per cell)
     const tetrahedronDefs = [];
     const createCellTetrahedra = (vertexIndices) => [
@@ -387,7 +401,7 @@ export class TetrahedralProbeSystem extends IndirectLightingSystem {
     const lCol = ctx.lightCol || [10, 10, 10];
     const sampleCount = ctx.sampleCount || 1024;
 
-    const persp = _persp(Math.PI/2, 1, 0.1, 20);
+    const persp = _persp(Math.PI/2, 1, 0.1, 100);
     const blk = new Float32Array([0,0,0,1]);
     const farD = new Float32Array([20,0,0,0]);
     const cT = [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]];
@@ -425,7 +439,18 @@ export class TetrahedralProbeSystem extends IndirectLightingSystem {
         const vp = _mul4(persp, _lookAt(pp, [pp[0]+cT[f][0],pp[1]+cT[f][1],pp[2]+cT[f][2]], cU[f]));
         gl.uniformMatrix4fv(gl.getUniformLocation(pProbe, 'uVP'), false, vp);
         gl.viewport(0, 0, cubemapResolution, cubemapResolution);
-        gl.clearBufferfv(gl.COLOR, 0, blk);
+        // Clear to sky color for this face direction
+        const faceDir = cT[f];
+        const faceY = faceDir[1];
+        let skyClear;
+        if (faceY >= 0.0) {
+          const t = faceY;
+          skyClear = [0.12*t + 0.80*(1-t), 0.30*t + 0.78*(1-t), 0.70*t + 0.85*(1-t), 1.0];
+        } else {
+          const t = -faceY;
+          skyClear = [0.80*(1-t) + 0.30*t, 0.78*(1-t) + 0.25*t, 0.85*(1-t) + 0.20*t, 1.0];
+        }
+        gl.clearBufferfv(gl.COLOR, 0, skyClear);
         gl.clearBufferfv(gl.COLOR, 1, blk);
         gl.clearBufferfv(gl.COLOR, 2, farD);
         gl.clear(gl.DEPTH_BUFFER_BIT);

@@ -121,7 +121,7 @@ export class LightFieldProbeSystem extends IndirectLightingSystem {
     const { NUM_PROBES, RES, OCT_RES, LOW_RES, pProbe, pOct, pIrr, pVSM } = this;
     if (!pProbe) return;
 
-    const persp  = _persp(Math.PI / 2, 1, 0.1, 20);
+    const persp  = _persp(Math.PI / 2, 1, 0.1, 100);
     const blk    = new Float32Array([0, 0, 0, 1]);
     const farD   = new Float32Array([20, 0, 0, 0]);
     const db3    = [gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1, gl.COLOR_ATTACHMENT2];

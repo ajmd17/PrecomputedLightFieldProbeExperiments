@@ -515,6 +515,30 @@ void main() {
 `;
 
 // ─── Forward lit (per-mesh SH for tetrahedral mode) ─────────────
+
+export const skyFrag = `#version 300 es
+precision highp float;
+in vec2 vUV;
+uniform vec3 uCamFwd;
+uniform vec3 uCamUp;
+uniform vec3 uCamRight;
+uniform float uTanHalfFov;
+uniform float uAspect;
+layout(location=0) out vec4 fColor;
+vec3 skyCol(vec3 dir) {
+  float y = max(dir.y, 0.0);
+  vec3 top = vec3(0.12, 0.30, 0.70);
+  vec3 horizon = vec3(0.80, 0.78, 0.85);
+  vec3 ground = vec3(0.30, 0.25, 0.20);
+  if (dir.y >= 0.0) return mix(horizon, top, y);
+  return mix(horizon, ground, -dir.y * 0.5);
+}
+void main() {
+  vec2 ndc = vUV * 2.0 - 1.0;
+  vec3 dir = normalize(uCamFwd + ndc.x * uCamRight * uTanHalfFov * uAspect + ndc.y * uCamUp * uTanHalfFov);
+  fColor = vec4(skyCol(dir) / (1.0 + skyCol(dir)), 1.0);
+}
+`;
 export const forwardFrag = `#version 300 es
 precision highp float;
 in vec3 vN;
@@ -523,7 +547,10 @@ in vec3 vW;
 uniform vec3 uSH[9];
 uniform vec3 uLightPos;
 uniform vec3 uLightCol;
+uniform vec3 uCameraPos;
 uniform float uShowIndirect;
+uniform float uSpecularPower;
+uniform float uSpecularStrength;
 layout(location=0) out vec4 fColor;
 
 vec3 evalSH(vec3 dir) {
@@ -543,17 +570,21 @@ vec3 evalSH(vec3 dir) {
 void main() {
   vec3 N = normalize(vN);
   vec3 L = normalize(uLightPos - vW);
+  vec3 V = normalize(uCameraPos - vW);
+  vec3 H = normalize(L + V);
   float NdotL = max(0.0, dot(N, L));
+  float NdotH = max(0.0, dot(N, H));
+  float spec = pow(NdotH, uSpecularPower) * uSpecularStrength;
   float distL = length(uLightPos - vW);
   float atten = min(1.0 / (1.0 + distL * distL * 0.05), 1.0);
-  vec3 direct = uLightCol * NdotL * atten;
+  vec3 diffuse = uLightCol * NdotL * atten;
+  vec3 specular = uLightCol * spec * atten;
   vec3 indirect = evalSH(N);
   vec3 color;
   if (uShowIndirect > 0.5) {
     color = indirect;
   } else {
-    vec3 direct = uLightCol * NdotL * atten;
-    color = vC * (direct + indirect);
+    color = vC * (diffuse + indirect) + specular;
   }
   fColor = vec4(color / (1.0 + color), 1.0);
 }

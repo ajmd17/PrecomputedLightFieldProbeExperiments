@@ -157,6 +157,7 @@ const programDirect = createProgram(shaderSources.quadVert, shaderSources.direct
 const programForward = createProgram(shaderSources.sceneGBufVert, shaderSources.forwardFrag);
 const programProject = createProgram(shaderSources.quadVert, shaderSources.shProjectFrag);
 const programTetDebug = createProgram(shaderSources.tetDebugVert, shaderSources.tetDebugFrag);
+const programSky = createProgram(shaderSources.quadVert, shaderSources.skyFrag);
 
 if (
   !programScene ||
@@ -169,7 +170,8 @@ if (
   !programDirect ||
   !programForward ||
   !programProject ||
-  !programTetDebug
+  !programTetDebug ||
+  !programSky
 ) {
   infoElement.textContent = 'Shader error';
   throw Error('shaders');
@@ -368,6 +370,12 @@ const sceneMeshes = [
   createSphere(-1, -0.5, 1.5, 0.8, 24, 16, 0.7, 0.2, 0.2),
   createCone(1, 0, 1.5, 0.7, 1.4, 24, 0.2, 0.4, 0.8),
   createTorus(0, 0, -1.5, 1.0, 0.35, 24, 16, 0.9, 0.7, 0.1),
+  // Outer cage walls (outside tetrahedral bounds — no indirect lighting)
+  createBox(0, -5.5, 0, 14, 0.5, 14, 0.25, 0.18, 0.18),
+  createBox(0, 5.5, 0, 14, 0.5, 14, 0.25, 0.18, 0.18),
+  createBox(-6.5, 0, 0, 0.5, 12, 14, 0.25, 0.18, 0.18),
+  createBox(6.5, 0, 0, 0.5, 12, 14, 0.25, 0.18, 0.18),
+  createBox(0, 0, -6.5, 14, 12, 0.5, 0.25, 0.18, 0.18),
 ];
 
 const sceneVAOs = (() => {
@@ -530,7 +538,7 @@ const tetrahedralSystem = new TetrahedralProbeSystem({
   gridX: 3,
   gridY: 3,
   gridZ: 3,
-  bounds: { min: [-3.5, -4, -2.5], max: [3.5, 3, 2.5] },
+  bounds: { min: [-5.5, -4.5, -5.5], max: [5.5, 4.5, 5.5] },
 });
 tetrahedralSystem.init(gl, sceneData);
 
@@ -548,18 +556,6 @@ tetrahedralSystem.precompute(gl, {
 });
 
 // Pre-compute per-mesh SH for tetrahedral rendering
-const centerSHResult = tetrahedralSystem.interpolateAt([0, 0, 0]);
-const centerSH = centerSHResult.sh;
-const barycentricString = centerSHResult.bary
-  ? centerSHResult.bary.map(value => value.toFixed(3)).join(',')
-  : 'null';
-console.log(
-  `[TET] center tetIndex=${centerSHResult.tetIndex} bary=${barycentricString}`
-);
-console.log(
-  `[TET] center SH R0=${centerSH[0].toFixed(3)} ` +
-  `G0=${centerSH[1].toFixed(3)} B0=${centerSH[2].toFixed(3)}`
-);
 
 const meshCentroids = sceneMeshes.map(mesh => {
   const positions = mesh.pos;
@@ -575,6 +571,7 @@ const meshCentroids = sceneMeshes.map(mesh => {
   return [sumX / count, sumY / count, sumZ / count];
 });
 
+const zeroSH = new Float32Array(27); // all zeros — no indirect
 const meshSH = sceneMeshes.map((_, meshIndex) => {
   const result = tetrahedralSystem.interpolateAt(meshCentroids[meshIndex]);
   if (result.tetIndex < 0) {
@@ -582,10 +579,10 @@ const meshSH = sceneMeshes.map((_, meshIndex) => {
       .map(value => value.toFixed(1))
       .join(',');
     console.log(
-      `[TET] mesh[${meshIndex}] centroid (${centroidString}) OUTSIDE — using fallback`
+      `[TET] mesh[${meshIndex}] centroid (${centroidString}) OUTSIDE — no indirect`
     );
   }
-  return result.tetIndex >= 0 ? result.sh : centerSH;
+  return result.tetIndex >= 0 ? result.sh : zeroSH;
 });
 
 // Build tetrahedron wireframe VAO
@@ -802,7 +799,7 @@ function renderFrame(timestamp) {
     Math.PI / 3,
     pixelWidth / pixelHeight,
     0.1,
-    20
+    100
   );
   const viewMatrix = lookAtMatrix(
     cameraPosition,
@@ -822,9 +819,36 @@ function renderFrame(timestamp) {
     gl.clearColor(0.05, 0.05, 0.05, 1);
     gl.clearDepth(1);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+    // Sky background (no depth test, fills entire frame)
+    gl.disable(gl.DEPTH_TEST);
+    gl.useProgram(programSky);
+    {
+      const cosYaw = Math.cos(cameraYaw);
+      const sinYaw = Math.sin(cameraYaw);
+      const cosPitch = Math.cos(cameraPitch);
+      const sinPitch = Math.sin(cameraPitch);
+      const forward = [cosYaw * cosPitch, sinPitch, sinYaw * cosPitch];
+      const up = [-cosYaw * sinPitch, cosPitch, -sinYaw * sinPitch];
+      const right = [-sinYaw, 0, cosYaw];
+      gl.uniform3fv(getUniformLocation(programSky, 'uCamFwd'), forward);
+      gl.uniform3fv(getUniformLocation(programSky, 'uCamUp'), up);
+      gl.uniform3fv(getUniformLocation(programSky, 'uCamRight'), right);
+    }
+    gl.uniform1f(
+      getUniformLocation(programSky, 'uTanHalfFov'),
+      Math.tan(Math.PI / 6)
+    );
+    gl.uniform1f(
+      getUniformLocation(programSky, 'uAspect'),
+      pixelWidth / pixelHeight
+    );
+    gl.bindVertexArray(quadVAO);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    gl.bindVertexArray(null);
+
     gl.enable(gl.DEPTH_TEST);
     gl.depthFunc(gl.LEQUAL);
-
     gl.useProgram(programForward);
     gl.uniformMatrix4fv(
       getUniformLocation(programForward, 'uVP'),
@@ -836,6 +860,18 @@ function renderFrame(timestamp) {
     gl.uniform1f(
       getUniformLocation(programForward, 'uShowIndirect'),
       showIndirect ? 1 : 0
+    );
+    gl.uniform3fv(
+      getUniformLocation(programForward, 'uCameraPos'),
+      cameraPosition
+    );
+    gl.uniform1f(
+      getUniformLocation(programForward, 'uSpecularPower'),
+      32.0
+    );
+    gl.uniform1f(
+      getUniformLocation(programForward, 'uSpecularStrength'),
+      0.5
     );
 
     for (let meshIndex = 0; meshIndex < sceneMeshes.length; meshIndex++) {
