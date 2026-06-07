@@ -290,6 +290,8 @@ function renderProbeGB(pi) {
   const pp = probePos[pi], gb = probeGB[pi], proj = persp(Math.PI/2, 1, 0.1, 20);
   gl.useProgram(pProbe);
   gl.uniform3fv(ul(pProbe, 'uQ'), pp);
+  gl.uniform3fv(ul(pProbe, 'uLightPos'), [0, 3.5, 0]);
+  gl.uniform3fv(ul(pProbe, 'uLightCol'), [1, 1, 1]);
   gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL); gl.disable(gl.CULL_FACE);
   const blk = new Float32Array([0, 0, 0, 1]);
   const farDist = new Float32Array([20, 0, 0, 0]);
@@ -555,8 +557,6 @@ function renderFrame(time) {
   gl.uniform1f(ul(pMarch, 'uAspect'), w/h);
   gl.uniform1f(ul(pMarch, 'uNormalBias'), 0.03);
   gl.uniform1f(ul(pMarch, 'uDistBias'), 0.02);
-  gl.uniform3fv(ul(pMarch, 'uLightPos'), [0, 3.5, 0]);
-  gl.uniform3fv(ul(pMarch, 'uLightCol'), [20, 20, 20]);
   gl.uniform1i(ul(pMarch,'uDebug'), debugMode);
   gl.uniform1i(ul(pMarch,'uSingleProbe'), singleProbe);
 

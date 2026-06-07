@@ -63,13 +63,21 @@ export const probeGBufFrag = `#version 300 es
 precision highp float;
 in vec3 vN; in vec3 vC; in vec3 vW;
 uniform vec3 uQ;
+uniform vec3 uLightPos;
+uniform vec3 uLightCol;
 layout(location=0) out vec4 oRad;
 layout(location=1) out vec4 oNrm;
 layout(location=2) out float oD;
 void main() {
   vec3 N = normalize(vN);
   if (dot(N, normalize(uQ - vW)) < 0.0) N = -N;
-  oRad = vec4(vC, 1); oNrm = vec4(N*0.5+0.5, 1); oD = length(vW - uQ);
+  vec3 L = normalize(uLightPos - vW);
+  float NdotL = max(0.0, dot(N, L));
+  float distL = length(uLightPos - vW);
+  float atten = min(1.0 / (1.0 + distL * distL * 0.01), 1.0);
+  vec3 direct = uLightCol * NdotL * atten;
+  vec3 rad = vC * direct;
+  oRad = vec4(rad, 1); oNrm = vec4(N*0.5+0.5, 1); oD = length(vW - uQ);
 }
 `;
 
@@ -166,8 +174,6 @@ uniform float uTanHalfFov;
 uniform float uAspect;
 uniform float uNormalBias;
 uniform float uDistBias;
-uniform vec3 uLightPos;
-uniform vec3 uLightCol;
 uniform int uDebug;
 uniform int uSingleProbe;
 
@@ -385,12 +391,7 @@ void main() {
   } else {
     indirect /= tw;
   }
-  vec3 L = normalize(uLightPos - P);
-  float NdotL = max(0.0, dot(N, L));
-  float distL = length(uLightPos - P);
-  float atten = 1.0 / (1.0 + distL * distL * 0.1);
-  vec3 direct = uLightCol * NdotL * atten;
-  vec3 color = (indirect + direct) * albedo;
+  vec3 color = indirect * albedo;
   fColor = vec4(color / (1.0 + color), 1.0);
 }
 `;
