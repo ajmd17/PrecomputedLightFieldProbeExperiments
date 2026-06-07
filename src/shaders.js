@@ -417,3 +417,170 @@ void main() {
   fColor = vec4(color / (1.0 + color), 1.0);
 }
 `;
+
+// ─── Cubemap → SH projection ────────────────────────────────────
+export const shProjectFrag = `#version 300 es
+precision highp float;
+#define PI 3.14159265
+uniform highp samplerCube uRad;
+uniform int uSampleCount;
+in vec2 vUV;
+layout(location=0) out vec4 fColor;
+
+vec3 fibSph(int i, int N) {
+  float p = acos(1.0-2.0*float(i+1)/float(N+1)), t = PI*(1.0+sqrt(5.0))*float(i);
+  return vec3(sin(p)*cos(t), sin(p)*sin(t), cos(p));
+}
+
+float shBasis(int band, vec3 d) {
+  float x=d.x, y=d.y, z=d.z;
+  if (band==0) return 0.282095;
+  if (band==1) return 0.488603*y;
+  if (band==2) return 0.488603*z;
+  if (band==3) return 0.488603*x;
+  if (band==4) return 1.092548*x*y;
+  if (band==5) return 1.092548*y*z;
+  if (band==6) return 0.315392*(3.0*z*z-1.0);
+  if (band==7) return 1.092548*x*z;
+  if (band==8) return 0.546274*(x*x-y*y);
+  return 0.0;
+}
+
+void main() {
+  int band = int(gl_FragCoord.x);
+  if (band>=9) { fColor=vec4(0); return; }
+  vec3 acc=vec3(0);
+  int Ns=uSampleCount;
+  for (int i=0; i<2048; i++) {
+    if (i>=Ns) break;
+    vec3 d=fibSph(i,Ns);
+    vec3 rad=texture(uRad,d).rgb;
+    acc+=rad*shBasis(band,d);
+  }
+  acc*=4.0*PI/float(Ns);
+  fColor=vec4(acc,1.0);
+}
+`;
+
+// ─── Direct lighting (G-buffer → screen, tetrahedral mode bg) ────
+export const directFrag = `#version 300 es
+precision highp float;
+uniform highp sampler2D uPos;
+uniform highp sampler2D uNrm;
+uniform highp sampler2D uAlb;
+uniform vec3 uLightPos;
+uniform vec3 uLightCol;
+uniform vec3 uAmbient;
+in vec2 vUV;
+layout(location=0) out vec4 fColor;
+void main() {
+  vec3 P = texture(uPos, vUV).xyz;
+  vec3 N = normalize(texture(uNrm, vUV).xyz * 2.0 - 1.0);
+  vec3 albedo = texture(uAlb, vUV).rgb;
+  if (length(P) < 0.001) {
+    fColor = vec4(0.1, 0.15, 0.25, 1.0);
+    return;
+  }
+  vec3 L = normalize(uLightPos - P);
+  float NdotL = max(0.0, dot(N, L));
+  float distL = length(uLightPos - P);
+  float atten = min(1.0 / (1.0 + distL * distL * 0.05), 1.0);
+  vec3 direct = uLightCol * NdotL * atten;
+  vec3 ambient = uAmbient * albedo;
+  vec3 color = albedo * direct + ambient;
+  fColor = vec4(color / (1.0 + color), 1.0);
+}
+`;
+
+// ─── Forward lit (per-mesh SH for tetrahedral mode) ─────────────
+export const forwardFrag = `#version 300 es
+precision highp float;
+in vec3 vN;
+in vec3 vC;
+in vec3 vW;
+uniform vec3 uSH[9];
+uniform vec3 uLightPos;
+uniform vec3 uLightCol;
+uniform vec3 uAmbient;
+layout(location=0) out vec4 fColor;
+
+vec3 evalSH(vec3 dir) {
+  float x = dir.x, y = dir.y, z = dir.z;
+  return
+    uSH[0] * 0.282095 +
+    uSH[1] * 0.488603 * y +
+    uSH[2] * 0.488603 * z +
+    uSH[3] * 0.488603 * x +
+    uSH[4] * 1.092548 * x * y +
+    uSH[5] * 1.092548 * y * z +
+    uSH[6] * 0.315392 * (3.0 * z * z - 1.0) +
+    uSH[7] * 1.092548 * x * z +
+    uSH[8] * 0.546274 * (x * x - y * y);
+}
+
+void main() {
+  vec3 N = normalize(vN);
+  vec3 L = normalize(uLightPos - vW);
+  float NdotL = max(0.0, dot(N, L));
+  float distL = length(uLightPos - vW);
+  float atten = min(1.0 / (1.0 + distL * distL * 0.05), 1.0);
+  vec3 direct = uLightCol * NdotL * atten;
+  vec3 indirect = evalSH(N);
+  vec3 color = vC * (direct + indirect + uAmbient);
+  fColor = vec4(color / (1.0 + color), 1.0);
+}
+`;
+
+// ─── SH sphere (tetrahedral system debug visualiser) ──────────────
+export const shSphereVert = `#version 300 es
+precision highp float;
+layout(location=0) in vec3 aPos;
+layout(location=1) in vec3 aNrm;
+uniform mat4 uVP;
+uniform mat4 uM;
+out vec3 vN;
+out vec3 vW;
+void main() {
+  vec4 wp = uM * vec4(aPos, 1);
+  vW = wp.xyz;
+  vN = mat3(uM) * aNrm;
+  gl_Position = uVP * wp;
+}
+`;
+
+export const shSphereFrag = `#version 300 es
+precision highp float;
+in vec3 vN;
+in vec3 vW;
+uniform vec3 uSH[9];
+uniform vec3 uLightPos;
+uniform vec3 uLightCol;
+uniform vec3 uBaseCol;
+layout(location=0) out vec4 fColor;
+
+vec3 evalSH(vec3 dir) {
+  float x = dir.x, y = dir.y, z = dir.z;
+  return
+    uSH[0] * 0.282095 +
+    uSH[1] * 0.488603 * y +
+    uSH[2] * 0.488603 * z +
+    uSH[3] * 0.488603 * x +
+    uSH[4] * 1.092548 * x * y +
+    uSH[5] * 1.092548 * y * z +
+    uSH[6] * 0.315392 * (3.0 * z * z - 1.0) +
+    uSH[7] * 1.092548 * x * z +
+    uSH[8] * 0.546274 * (x * x - y * y);
+}
+
+void main() {
+  vec3 N = normalize(vN);
+  vec3 L = normalize(uLightPos - vW);
+  float NdotL = max(0.0, dot(N, L));
+  float distL = length(uLightPos - vW);
+  float atten = min(1.0 / (1.0 + distL * distL * 0.1), 1.0);
+  vec3 direct = uLightCol * NdotL * atten;
+  vec3 indirect = evalSH(N);
+  vec3 color = uBaseCol * (direct + indirect);
+  fColor = vec4(color / (1.0 + color), 1.0);
+}
+`;

@@ -1,5 +1,7 @@
 import * as S from './shaders.js';
 import { VoxelGrid, sceneBounds, voxelizeScene } from './voxel.js';
+import { LightFieldProbeSystem } from './gi/lightFieldProbe.js';
+import { TetrahedralProbeSystem } from './gi/tetrahedralProbe.js';
 
 const RES = 128;
 const OCT_RES = 256;
@@ -67,7 +69,11 @@ const pOct   = mkProg(S.quadVert, S.octFrag);
 const pIrr   = mkProg(S.quadVert, S.irrFrag);
 const pVSM   = mkProg(S.quadVert, S.vsmFrag);
 const pMarch = mkProg(S.quadVert, S.raymarchFrag);
-if (!pScene||!pProbe||!pOct||!pIrr||!pVSM||!pMarch) { info.textContent='Shader error'; throw Error('shaders'); }
+const pSHSphere = mkProg(S.shSphereVert, S.shSphereFrag);
+const pDirect = mkProg(S.quadVert, S.directFrag);
+const pForward = mkProg(S.sceneGBufVert, S.forwardFrag);
+const pProject = mkProg(S.quadVert, S.shProjectFrag);
+if (!pScene||!pProbe||!pOct||!pIrr||!pVSM||!pMarch||!pSHSphere||!pDirect||!pForward||!pProject) { info.textContent='Shader error'; throw Error('shaders'); }
 info.textContent='Shaders OK';
 
 // ─── Full-screen quad ────────────────────────────────────────────────
@@ -117,32 +123,21 @@ function sphere(cx,cy,cz, r, slats, staves, rcol,gcol,bcol) {
 function cone(cx,cy,cz, rad, height, segs, rcol,gcol,bcol) {
   const p = [], n = [];
   const tip = [cx, cy+height/2, cz], baseC = [cx, cy-height/2, cz];
-  // side vertices
   for (let i = 0; i <= segs; i++) {
     const a = i / segs * 2 * Math.PI;
     const x = rad * Math.cos(a), z = rad * Math.sin(a);
     p.push(baseC[0]+x, baseC[1], baseC[2]+z);
-    // side normal: normalize(cross(tangent_u, tangent_v))
     const dx = x, dz = z, dl = Math.sqrt(dx*dx + dz*dz);
     const nx = dx/dl * height/2, ny = rad, nz = dz/dl * height/2;
     const nl = Math.sqrt(nx*nx + ny*ny + nz*nz);
     n.push(nx/nl, ny/nl, nz/nl);
   }
-  // tip vertex
-  p.push(tip[0], tip[1], tip[2]);
-  n.push(0, 1, 0);
-  // base center
-  p.push(baseC[0], baseC[1], baseC[2]);
-  n.push(0, -1, 0);
+  p.push(tip[0], tip[1], tip[2]); n.push(0, 1, 0);
+  p.push(baseC[0], baseC[1], baseC[2]); n.push(0, -1, 0);
   const tipIdx = p.length/3-2, baseIdx = p.length/3-1;
   const idx = [];
-  for (let i = 0; i < segs; i++) {
-    idx.push(i, (i+1)%segs, tipIdx);
-  }
-  // base cap (triangle fan)
-  for (let i = 1; i < segs-1; i++) {
-    idx.push(baseIdx, i, i+1);
-  }
+  for (let i = 0; i < segs; i++) idx.push(i, (i+1)%segs, tipIdx);
+  for (let i = 1; i < segs-1; i++) idx.push(baseIdx, i, i+1);
   return {pos:p, nrm:n, col:[rcol,gcol,bcol], idx};
 }
 function torus(cx,cy,cz, R, r, us, vs, rcol,gcol,bcol) {
@@ -169,22 +164,19 @@ function torus(cx,cy,cz, R, r, us, vs, rcol,gcol,bcol) {
 }
 
 const M = [
-  // Room
   box(0,-4,0, 10,0.5,10, 0.9,0.9,0.9),
   box(-5,0,0, 0.5,8,10, 1.0,0.2,0.2),
   box(5,0,0, 0.5,8,10, 0.2,0.2,1.0),
   box(0,0,-5, 10,8,0.5, 0.8,0.8,0.8),
   box(0,4,0, 10,0.5,10, 0.6,0.6,0.6),
-  // Existing objects
   box(-2,-3,0, 2,2,2, 0.1,0.9,0.1),
   box(2.5,-2.5,-2, 1.5,3,1.5, 1.0,0.6,0.1),
-  // Ceiling light
   box(0,3.5,0, 4,0.2,4, 5.0,5.0,5.0),
-  // New shapes
   sphere(-1, -0.5, 1.5, 0.8, 24, 16, 0.7, 0.2, 0.2),
   cone(1, 0, 1.5, 0.7, 1.4, 24, 0.2, 0.6, 0.4),
   torus(0, 0, -1.5, 1.0, 0.35, 24, 16, 0.9, 0.7, 0.1),
 ];
+
 const sceneVAOs = (() => {
   const r = [];
   for (const m of M) {
@@ -214,9 +206,8 @@ const occ = voxels.occ.reduce((a,b)=>a+b, 0);
 console.log(`${occ} / ${VOX**3} occupied (${(occ/(VOX**3)*100).toFixed(1)}%)`);
 window.__v = voxels;
 
-// Debug probe sphere VAO (rendered into G-buffer for spatial visualization)
+// Debug probe sphere VAO
 const debugSphereMesh = sphere(0,0,0, 0.12, 12, 8, 5, 5, 5);
-// Negate normals so the probe center passes the backface test (inward-facing normals)
 for (let i = 0; i < debugSphereMesh.nrm.length; i++) debugSphereMesh.nrm[i] = -debugSphereMesh.nrm[i];
 const debugSphereVAO = (() => {
   const m = debugSphereMesh;
@@ -235,244 +226,91 @@ const debugSphereVAO = (() => {
   return {vao, count:m.idx.length};
 })();
 
-// ─── Probe grid ──────────────────────────────────────────────────────
+// SH test sphere VAO (rendered in tetrahedral mode)
+const shSphereMesh = sphere(0,0,0, 0.25, 16, 12, 1, 1, 1);
+const shSphereVAO = (() => {
+  const m = shSphereMesh;
+  const vc = m.pos.length/3;
+  const pb=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,pb); gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(m.pos),gl.STATIC_DRAW);
+  const nb=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,nb); gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(m.nrm),gl.STATIC_DRAW);
+  const ib=gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,ib); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,new Uint16Array(m.idx),gl.STATIC_DRAW);
+  const vao=gl.createVertexArray(); gl.bindVertexArray(vao);
+  gl.bindBuffer(gl.ARRAY_BUFFER,pb); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0,3,gl.FLOAT,false,0,0);
+  gl.bindBuffer(gl.ARRAY_BUFFER,nb); gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1,3,gl.FLOAT,false,0,0);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,ib);
+  gl.bindVertexArray(null);
+  return {vao, count:m.idx.length};
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
+//  GI SYSTEMS
+// ═══════════════════════════════════════════════════════════════════════
+
 const GMIN = [-4.0, -5.0, -3.5], GMAX = [4.0, 3.0, 2.0];
 const MAX_PROBES = 256;
-const probePos = Array.from({length:NUM_PROBES}, (_,i)=>{
-  const ix=i%NX, iy=Math.floor(i/NX)%NY, iz=Math.floor(i/(NX*NY));
-  const tx=ix/(NX-1), ty=iy/(NY-1), tz=iz/(NZ-1);
-  return [GMIN[0]+tx*(GMAX[0]-GMIN[0]), GMIN[1]+ty*(GMAX[1]-GMIN[1]), GMIN[2]+tz*(GMAX[2]-GMIN[2])];
+
+const sceneData = { sceneVAOs, M, bounds, voxels };
+const programs = { pProbe, pOct, pIrr, pVSM };
+
+const lfp = new LightFieldProbeSystem({
+  res: RES, octRes: OCT_RES, lowRes: LOW_RES,
+  nx: NX, ny: NY, nz: NZ,
+  gMin: GMIN, gMax: GMAX,
+  maxProbes: MAX_PROBES,
 });
-// ─── Probe offsets from voxel occupancy ────────────────────────────
-function rayDistToTri(ro, rd, v0, v1, v2) {
-  const e10 = v1[0]-v0[0], e11 = v1[1]-v0[1], e12 = v1[2]-v0[2];
-  const e20 = v2[0]-v0[0], e21 = v2[1]-v0[1], e22 = v2[2]-v0[2];
-  const pv0 = rd[1]*e22 - rd[2]*e21, pv1 = rd[2]*e20 - rd[0]*e22, pv2 = rd[0]*e21 - rd[1]*e20;
-  const det = e10*pv0 + e11*pv1 + e12*pv2;
-  if (Math.abs(det) < 1e-12) return null;
-  const inv = 1/det;
-  const tv0 = ro[0]-v0[0], tv1 = ro[1]-v0[1], tv2 = ro[2]-v0[2];
-  const u = (tv0*pv0 + tv1*pv1 + tv2*pv2) * inv;
-  if (u < 0 || u > 1) return null;
-  const qv0 = tv1*e12 - tv2*e11, qv1 = tv2*e10 - tv0*e12, qv2 = tv0*e11 - tv1*e10;
-  const v = (rd[0]*qv0 + rd[1]*qv1 + rd[2]*qv2) * inv;
-  if (v < 0 || u+v > 1) return null;
-  const t = (e20*qv0 + e21*qv1 + e22*qv2) * inv;
-  return t > 1e-8 ? t : null;
-}
-function insideMesh(px, py, pz, meshes) {
-  const ro = [px, py, pz];
-  const dirs = [[1,0,0],[0,1,0],[0,0,1]];
-  for (const rd of dirs) {
-    let hits = 0;
-    for (const mesh of meshes) {
-      const pos = mesh.pos, idx = mesh.idx;
-      for (let ti = 0; ti < idx.length; ti += 3) {
-        const v0 = [pos[idx[ti]*3], pos[idx[ti]*3+1], pos[idx[ti]*3+2]];
-        const v1 = [pos[idx[ti+1]*3], pos[idx[ti+1]*3+1], pos[idx[ti+1]*3+2]];
-        const v2 = [pos[idx[ti+2]*3], pos[idx[ti+2]*3+1], pos[idx[ti+2]*3+2]];
-        if (rayDistToTri(ro, rd, v0, v1, v2) !== null) hits++;
-      }
-    }
-    if (hits % 2 === 1) return true;
+lfp.setRenderResources(qVAO, sceneVAOs);
+lfp.init(gl, sceneData, programs);
+
+const tetSys = new TetrahedralProbeSystem();
+tetSys.init(gl, sceneData);
+
+// Render cubemaps from each tet probe position and project to SH
+tetSys.precompute(gl, {
+  pProbe, pProject, sceneVAOs, qVAO,
+  lightPos: [0, 3.5, 0],
+  lightCol: [10, 10, 10],
+  res: RES, sampleCount: 1024,
+  info // DOM element for progress
+});
+
+// Pre-compute per-mesh SH for tetrahedral mode
+const centerResult = tetSys.interpolateAt([0, 0, 0]);
+const centerSH = centerResult.sh;
+console.log(`[TET] center tetIndex=${centerResult.tetIndex} bary=${centerResult.bary ? centerResult.bary.map(v=>v.toFixed(3)).join(',') : 'null'}`);
+console.log(`[TET] center SH R0=${centerSH[0].toFixed(3)} G0=${centerSH[1].toFixed(3)} B0=${centerSH[2].toFixed(3)}`);
+
+const meshCentroids = M.map(m => {
+  const pos = m.pos;
+  let cx = 0, cy = 0, cz = 0;
+  for (let i = 0; i < pos.length; i += 3) { cx += pos[i]; cy += pos[i+1]; cz += pos[i+2]; }
+  const n = pos.length / 3;
+  return [cx/n, cy/n, cz/n];
+});
+const meshSH = M.map((_, mi) => {
+  const r = tetSys.interpolateAt(meshCentroids[mi]);
+  if (r.tetIndex < 0) {
+    console.log(`[TET] mesh[${mi}] centroid (${meshCentroids[mi].map(v=>v.toFixed(1)).join(',')}) OUTSIDE — using fallback`);
   }
-  return false;
-}
-function findNearestExit(px, py, pz, meshes) {
-  const ro = [px, py, pz];
-  const dirs = [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]];
-  let bestT = Infinity, bestD = null;
-  for (const rd of dirs) {
-    for (const mesh of meshes) {
-      const pos = mesh.pos, idx = mesh.idx;
-      for (let ti = 0; ti < idx.length; ti += 3) {
-        const v0 = [pos[idx[ti]*3], pos[idx[ti]*3+1], pos[idx[ti]*3+2]];
-        const v1 = [pos[idx[ti+1]*3], pos[idx[ti+1]*3+1], pos[idx[ti+1]*3+2]];
-        const v2 = [pos[idx[ti+2]*3], pos[idx[ti+2]*3+1], pos[idx[ti+2]*3+2]];
-        const t = rayDistToTri(ro, rd, v0, v1, v2);
-        if (t !== null && t < bestT) { bestT = t; bestD = rd; }
-      }
-    }
-  }
-  return bestD === null ? null : [bestD[0]*(bestT+0.05), bestD[1]*(bestT+0.05), bestD[2]*(bestT+0.05)];
-}
-const probeOffsets = [], probeActive = new Float32Array(MAX_PROBES);
-let pushed = 0, inactive = 0;
-for (let i = 0; i < NX * NY * NZ; i++) {
-  const ix = i % NX, iy = Math.floor(i / NX) % NY, iz = Math.floor(i / (NX * NY));
-  const wx = GMIN[0] + (ix/(NX-1))*(GMAX[0]-GMIN[0]);
-  const wy = GMIN[1] + (iy/(NY-1))*(GMAX[1]-GMIN[1]);
-  const wz = GMIN[2] + (iz/(NZ-1))*(GMAX[2]-GMIN[2]);
-  if (insideMesh(wx, wy, wz, M)) {
-    const off = findNearestExit(wx, wy, wz, M);
-    if (off) {
-      probeOffsets.push(off);
-      probeActive[i] = 1.0;
-      pushed++;
-    } else {
-      probeOffsets.push([0, 0, 0]);
-      probeActive[i] = 0.0;
-      inactive++;
-    }
-  } else {
-    probeOffsets.push([0, 0, 0]);
-    probeActive[i] = 1.0;
-  }
-}
-const adjProbePos = probePos.map((p, i) => [p[0] + probeOffsets[i][0], p[1] + probeOffsets[i][1], p[2] + probeOffsets[i][2]]);
-console.log(`Probe offsets: ${pushed} pushed, ${inactive} inactive, ${NUM_PROBES-pushed-inactive} untouched`);
+  return r.tetIndex >= 0 ? r.sh : centerSH;
+});
 
-const probePosFlat = new Float32Array(MAX_PROBES * 3);
-for (let i = 0; i < NUM_PROBES; i++) {
-  probePosFlat[i*3] = adjProbePos[i][0];
-  probePosFlat[i*3+1] = adjProbePos[i][1];
-  probePosFlat[i*3+2] = adjProbePos[i][2];
-}
-
-// ─── Probe G-buffer cubemap allocation ────────────────────────────────
-function allocProbeGB() {
-  const depthCM = gl.createTexture();
-  gl.bindTexture(gl.TEXTURE_CUBE_MAP, depthCM);
-  for (let j = 0; j < 6; j++) gl.texImage2D(gl.TEXTURE_CUBE_MAP_POSITIVE_X+j, 0, gl.DEPTH_COMPONENT24, RES, RES, 0, gl.DEPTH_COMPONENT, gl.UNSIGNED_INT, null);
-  gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-  gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-  gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
-  return { fbo:gl.createFramebuffer(), rad:cmF16(RES,RES), nrm:cmF16(RES,RES), dist:cmR16F(RES,RES), depthCM };
-}
-function freeProbeGB(gb) {
-  gl.deleteFramebuffer(gb.fbo);
-  gl.deleteTexture(gb.rad); gl.deleteTexture(gb.nrm); gl.deleteTexture(gb.dist); gl.deleteTexture(gb.depthCM);
-}
-const db3 = [gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1, gl.COLOR_ATTACHMENT2];
-function bindGBFace(fbo, face, r, n, d, depth) {
-  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
-  const t = gl.TEXTURE_CUBE_MAP_POSITIVE_X + face;
-  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, t, r, 0);
-  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, t, n, 0);
-  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT2, t, d, 0);
-  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, t, depth, 0);
-  gl.drawBuffers(db3);
-}
-
-// ─── Texture arrays ──────────────────────────────────────────────────
-const OW = OCT_RES*2, OH = OCT_RES;
-const LW = LOW_RES*2, LH = LOW_RES;
-const irrArr = t2DA(OW, OH, NUM_PROBES, 4, gl.NEAREST);
-const vsmArr = t2DA(OW, OH, NUM_PROBES, 2, gl.LINEAR);
-const distHArr = t2DA(OW, OH, NUM_PROBES, 1, gl.LINEAR);
-const distLArr = t2DA(LW, LH, NUM_PROBES, 1, gl.LINEAR);
-
-const layerFBO = gl.createFramebuffer();
-
-// ─── Math ────────────────────────────────────────────────────────────
-function persp(fov,a,near,far){const f=1/Math.tan(fov/2), nf=1/(near-far); return new Float32Array([f/a,0,0,0, 0,f,0,0, 0,0,(far+near)*nf,-1, 0,0,2*far*near*nf,0]);}
-function lookAt(e,t,u){const z=norm(sub(e,t)), x=norm(cross(u,z)), y=cross(z,x); return new Float32Array([x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0, -dot(x,e),-dot(y,e),-dot(z,e),1]);}
-function norm(v){const l=Math.hypot(v[0],v[1],v[2]);return[v[0]/l,v[1]/l,v[2]/l];}
-function sub(a,b){return[a[0]-b[0],a[1]-b[1],a[2]-b[2]];}
-function cross(a,b){return[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];}
-function dot(a,b){return a[0]*b[0]+a[1]*b[1]+a[2]*b[2];}
-function mul4(a,b){const r=new Float32Array(16);for(let i=0;i<4;i++)for(let j=0;j<4;j++)r[j*4+i]=a[i]*b[j*4]+a[4+i]*b[j*4+1]+a[8+i]*b[j*4+2]+a[12+i]*b[j*4+3];return r;}
-const ID=new Float32Array([1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]);
-
-const cT=[[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]];
-const cU=[[0,-1,0],[0,-1,0],[0,0,1],[0,0,-1],[0,-1,0],[0,-1,0]];
+// Which system is active (LFP disabled for now)
+let activeSystem = 'tetrahedral';
+let lfpReady = false;
 
 // ═══════════════════════════════════════════════════════════════════════
 //  PRECOMPUTATION
 // ═══════════════════════════════════════════════════════════════════════
 
-function renderProbeGB(gb, pp) {
-  const proj = persp(Math.PI/2, 1, 0.1, 20);
-  gl.useProgram(pProbe);
-  gl.uniform3fv(ul(pProbe, 'uQ'), pp);
-  gl.uniform3fv(ul(pProbe, 'uLightPos'), [0, 3.5, 0]);
-  gl.uniform3fv(ul(pProbe, 'uLightCol'), [10, 10, 10]);
-  gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL); gl.disable(gl.CULL_FACE);
-  const blk = new Float32Array([0, 0, 0, 1]);
-  const farDist = new Float32Array([20, 0, 0, 0]);
-  for (let f = 0; f < 6; f++) {
-    bindGBFace(gb.fbo, f, gb.rad, gb.nrm, gb.dist, gb.depthCM);
-    const vp = mul4(proj, lookAt(pp, [pp[0]+cT[f][0],pp[1]+cT[f][1],pp[2]+cT[f][2]], cU[f]));
-    gl.uniformMatrix4fv(ul(pProbe, 'uVP'), false, vp);
-    gl.viewport(0,0,RES,RES);
-    gl.clearBufferfv(gl.COLOR, 0, blk);
-    gl.clearBufferfv(gl.COLOR, 1, blk);
-    gl.clearBufferfv(gl.COLOR, 2, farDist);
-    gl.clear(gl.DEPTH_BUFFER_BIT);
-    for (const m of sceneVAOs) { gl.uniformMatrix4fv(ul(pProbe,'uM'),false,ID); gl.bindVertexArray(m.vao); gl.drawElements(gl.TRIANGLES,m.count,gl.UNSIGNED_SHORT,0); gl.bindVertexArray(null); }
-  }
-}
-
-function makeOctPass(layer, cm, arr, prog, nrmCM, distCM) {
-  gl.bindFramebuffer(gl.FRAMEBUFFER, layerFBO);
-  gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, arr, 0, layer);
-  gl.drawBuffers([gl.COLOR_ATTACHMENT0]);
-  gl.viewport(0,0,OW,OH); gl.disable(gl.DEPTH_TEST);
-  gl.useProgram(prog);
-  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_CUBE_MAP, cm);
-  gl.uniform1i(ul(prog, 'uRad'), 0);
-  if (prog === pOct) {
-    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_CUBE_MAP, nrmCM);
-    gl.uniform1i(ul(prog, 'uNrm'), 1);
-    gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_CUBE_MAP, distCM);
-    gl.uniform1i(ul(prog, 'uDist'), 2);
-  }
-  if (prog === pIrr) { gl.uniform1i(ul(prog, 'uN'), 1024); gl.uniform1f(ul(prog, 'uWrap'), 0.3); }
-  const st = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
-  if (st !== gl.FRAMEBUFFER_COMPLETE) console.error('FBO inc:', st);
-  gl.bindVertexArray(qVAO); gl.drawArrays(gl.TRIANGLES,0,6); gl.bindVertexArray(null);
-}
-
 function precompute() {
-  for (let i = 0; i < NUM_PROBES; i++) {
-    info.textContent = `Precomputing ${i+1}/${NUM_PROBES}...`;
-    const gb = allocProbeGB();
-    renderProbeGB(gb, adjProbePos[i]);
-
-    // High-res octahedral distance → distHArr
-    makeOctPass(i, gb.dist, distHArr, pOct, gb.nrm, gb.dist);
-
-    // Low-res octahedral distance → distLArr
-    gl.bindFramebuffer(gl.FRAMEBUFFER, layerFBO);
-    gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, distLArr, 0, i);
-    gl.drawBuffers([gl.COLOR_ATTACHMENT0]);
-    gl.viewport(0,0,LW,LH); gl.disable(gl.DEPTH_TEST);
-    gl.useProgram(pOct);
-    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_CUBE_MAP, gb.dist);
-    gl.uniform1i(ul(pOct,'uRad'),0);
-    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_CUBE_MAP, gb.nrm);
-    gl.uniform1i(ul(pOct,'uNrm'),1);
-    gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_CUBE_MAP, gb.dist);
-    gl.uniform1i(ul(pOct,'uDist'),2);
-    gl.bindVertexArray(qVAO); gl.drawArrays(gl.TRIANGLES,0,6); gl.bindVertexArray(null);
-
-    // Irradiance filter → irrArr
-    makeOctPass(i, gb.rad, irrArr, pIrr, null, null);
-
-    // VSM filter → vsmArr (cosine-power pre-filter)
-    gl.bindFramebuffer(gl.FRAMEBUFFER, layerFBO);
-    gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, vsmArr, 0, i);
-    gl.drawBuffers([gl.COLOR_ATTACHMENT0]);
-    gl.viewport(0,0,OW,OH);
-    gl.useProgram(pVSM);
-    gl.uniform1f(ul(pVSM,'uCosinePower'), 50.0);
-    gl.uniform1i(ul(pVSM,'uSampleCount'), 64);
-    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_CUBE_MAP, gb.dist);
-    gl.uniform1i(ul(pVSM,'uDist'),0);
-    gl.bindVertexArray(qVAO); gl.drawArrays(gl.TRIANGLES,0,6); gl.bindVertexArray(null);
-
-    freeProbeGB(gb);
-  }
-  info.textContent = `${NUM_PROBES} probes ready.`;
+  // LFP precompute skipped — tetrahedral mode active
+  info.textContent = `${NUM_PROBES} probe slots ready (tetrahedral mode).`;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
 //  RENDERING
 // ═══════════════════════════════════════════════════════════════════════
 
-// Scene G-buffer textures + depth (sized dynamically)
 let scenePosTex, sceneNrmTex, sceneAlbTex, sceneDepthRB, sceneFBO;
 
 function resizeSceneBufs(w, h) {
@@ -497,7 +335,7 @@ function resizeSceneBufs(w, h) {
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 }
 
-// ─── Camera controls (WASD + mouse look) ────────────────────────────
+// ─── Camera controls ────────────────────────────────────────────────
 let camPos = [0, 1, 8];
 let yaw = 0, pitch = 0;
 const keys = new Set();
@@ -508,7 +346,8 @@ let probeCycle = [0,0,0,0,0,0,0,0,0,0];
 
 function updateInfo() {
   const sp = singleProbe >= 0 ? ` [probe:${singleProbe}]` : '';
-  info.textContent = (document.pointerLockElement === canvas ? 'Click to release mouse' : `${NUM_PROBES} probes ready`) + sp;
+  const gi = activeSystem === 'lightfield' ? 'LFP' : 'TET';
+  info.textContent = (document.pointerLockElement === canvas ? 'Click to release mouse' : `${gi} | ${NUM_PROBES} probes ready`) + sp;
 }
 
 canvas.addEventListener('click', () => canvas.requestPointerLock());
@@ -522,13 +361,20 @@ document.addEventListener('keydown', e => {
   keys.add(e.code);
   const digit = parseInt(e.code.replace('Digit', ''));
   const isDigit = !isNaN(digit) && digit >= 0 && digit <= 9;
-  if (isDigit) {
+  if (isDigit && activeSystem === 'lightfield') {
     const maxOff = Math.ceil((NUM_PROBES - 1 - digit) / 10);
     const off = probeCycle[digit];
     singleProbe = off * 10 + digit;
+    lfp.singleProbe = singleProbe;
     probeCycle[digit] = (off + 1) > maxOff ? 0 : off + 1;
   } else if (e.code === 'KeyR') {
     singleProbe = -1;
+    lfp.singleProbe = -1;
+  } else if (e.code === 'KeyT') {
+    activeSystem = activeSystem === 'lightfield' ? 'tetrahedral' : 'lightfield';
+    singleProbe = -1;
+    lfp.singleProbe = -1;
+    console.log(`[GI] Switched to ${activeSystem}`);
   }
   updateInfo();
 });
@@ -552,6 +398,11 @@ function updateCamera(dt) {
 function add(a, b) { return [a[0]+b[0], a[1]+b[1], a[2]+b[2]]; }
 function scale(a, s) { return [a[0]*s, a[1]*s, a[2]*s]; }
 
+// SH test sphere orbit
+let testPhi = 0;
+const ORBIT_RADIUS = 0.6;
+const ORBIT_SPEED = 0.6;
+
 let lastTime = 0;
 
 function renderFrame(time) {
@@ -567,80 +418,141 @@ function renderFrame(time) {
   const view = lookAt(camPos, add(camPos, [Math.cos(yaw)*Math.cos(pitch), Math.sin(pitch), Math.sin(yaw)*Math.cos(pitch)]), [0,1,0]);
   const vp = mul4(proj, view);
 
-  // 1. Scene G-buffer
-  gl.bindFramebuffer(gl.FRAMEBUFFER, sceneFBO);
-  gl.viewport(0,0,w,h);
-  gl.clearColor(0,0,0,1); gl.clearDepth(1);
-  gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
-  gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL); gl.disable(gl.CULL_FACE);
-  gl.useProgram(pScene);
-  gl.uniformMatrix4fv(ul(pScene,'uVP'), false, vp);
-  for (const m of sceneVAOs) { gl.uniformMatrix4fv(ul(pScene,'uM'),false,ID); gl.bindVertexArray(m.vao); gl.drawElements(gl.TRIANGLES,m.count,gl.UNSIGNED_SHORT,0); gl.bindVertexArray(null); }
-  if (singleProbe >= 0) {
-    const pp = adjProbePos[singleProbe];
-    const M = new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, pp[0],pp[1],pp[2],1]);
-    gl.uniformMatrix4fv(ul(pScene,'uM'), false, M);
-    gl.bindVertexArray(debugSphereVAO.vao);
-    gl.drawElements(gl.TRIANGLES, debugSphereVAO.count, gl.UNSIGNED_SHORT, 0);
-    gl.bindVertexArray(null);
+  // ── 1. Forward render (tetrahedral mode) ──────────────────────
+  if (activeSystem === 'tetrahedral') {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0,0,w,h);
+    gl.clearColor(0.05,0.05,0.05,1); gl.clearDepth(1);
+    gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+    gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL);
+
+    gl.useProgram(pForward);
+    gl.uniformMatrix4fv(ul(pForward,'uVP'), false, vp);
+    gl.uniform3fv(ul(pForward,'uLightPos'), [0, 3.5, 0]);
+    gl.uniform3fv(ul(pForward,'uLightCol'), [10, 10, 10]);
+    gl.uniform3fv(ul(pForward,'uAmbient'), [0.03, 0.04, 0.06]);
+
+    for (let mi = 0; mi < M.length; mi++) {
+      gl.uniform3fv(ul(pForward, 'uSH'), meshSH[mi]);
+      gl.uniformMatrix4fv(ul(pForward,'uM'), false, ID);
+      gl.bindVertexArray(sceneVAOs[mi].vao);
+      gl.drawElements(gl.TRIANGLES, sceneVAOs[mi].count, gl.UNSIGNED_SHORT, 0);
+      gl.bindVertexArray(null);
+    }
+    gl.disable(gl.DEPTH_TEST);
+
   } else {
-    for (let pi = 0; pi < NUM_PROBES; pi++) {
-      const pp = adjProbePos[pi];
+    // ── 1. Scene G-buffer (LFP mode) ──────────────────────────────
+    gl.bindFramebuffer(gl.FRAMEBUFFER, sceneFBO);
+    gl.viewport(0,0,w,h);
+    gl.clearColor(0,0,0,1); gl.clearDepth(1);
+    gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+    gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL); gl.disable(gl.CULL_FACE);
+    gl.useProgram(pScene);
+    gl.uniformMatrix4fv(ul(pScene,'uVP'), false, vp);
+
+    for (const m of sceneVAOs) { gl.uniformMatrix4fv(ul(pScene,'uM'),false,ID); gl.bindVertexArray(m.vao); gl.drawElements(gl.TRIANGLES,m.count,gl.UNSIGNED_SHORT,0); gl.bindVertexArray(null); }
+
+    if (singleProbe >= 0) {
+      const pp = lfp.adjProbePos[singleProbe];
       const M = new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, pp[0],pp[1],pp[2],1]);
       gl.uniformMatrix4fv(ul(pScene,'uM'), false, M);
       gl.bindVertexArray(debugSphereVAO.vao);
       gl.drawElements(gl.TRIANGLES, debugSphereVAO.count, gl.UNSIGNED_SHORT, 0);
       gl.bindVertexArray(null);
+    } else {
+      for (let pi = 0; pi < NUM_PROBES; pi++) {
+        const pp = lfp.adjProbePos[pi];
+        const M = new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, pp[0],pp[1],pp[2],1]);
+        gl.uniformMatrix4fv(ul(pScene,'uM'), false, M);
+        gl.bindVertexArray(debugSphereVAO.vao);
+        gl.drawElements(gl.TRIANGLES, debugSphereVAO.count, gl.UNSIGNED_SHORT, 0);
+        gl.bindVertexArray(null);
+      }
+    }
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+    // ── 2. Background pass (LFP mode) ──────────────────────────────
+    gl.viewport(0,0,w,h);
+    gl.clearColor(0.05,0.05,0.05,1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.disable(gl.DEPTH_TEST);
+
+    if (lfpReady) {
+      gl.useProgram(pMarch);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, scenePosTex);
+      gl.uniform1i(ul(pMarch,'uPos'),0);
+      gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, sceneNrmTex);
+      gl.uniform1i(ul(pMarch,'uNrm'),1);
+      gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, sceneAlbTex);
+      gl.uniform1i(ul(pMarch,'uAlb'),2);
+      lfp.bindUniforms(gl, pMarch);
+      {
+        const cy = Math.cos(yaw), sy = Math.sin(yaw);
+        const cp = Math.cos(pitch), sp = Math.sin(pitch);
+        const fwd = [cy*cp, sp, sy*cp], up = [-cy*sp, cp, -sy*sp], right = [-sy, 0, cy];
+        gl.uniform3fv(ul(pMarch, 'uCamFwd'), fwd);
+        gl.uniform3fv(ul(pMarch, 'uCamUp'), up);
+        gl.uniform3fv(ul(pMarch, 'uCamRight'), right);
+      }
+      gl.uniform1f(ul(pMarch, 'uTanHalfFov'), Math.tan(Math.PI/6));
+      gl.uniform1f(ul(pMarch, 'uAspect'), w/h);
+      gl.uniform1f(ul(pMarch, 'uNormalBias'), 0.03);
+      gl.uniform1f(ul(pMarch, 'uDistBias'), 0.02);
+      gl.uniform1i(ul(pMarch,'uDebug'), 0);
+      gl.uniform1i(ul(pMarch,'uSingleProbe'), singleProbe);
+      gl.bindVertexArray(qVAO); gl.drawArrays(gl.TRIANGLES, 0, 6); gl.bindVertexArray(null);
+    } else {
+      gl.useProgram(pDirect);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, scenePosTex);
+      gl.uniform1i(ul(pDirect,'uPos'),0);
+      gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, sceneNrmTex);
+      gl.uniform1i(ul(pDirect,'uNrm'),1);
+      gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, sceneAlbTex);
+      gl.uniform1i(ul(pDirect,'uAlb'),2);
+      gl.uniform3fv(ul(pDirect,'uLightPos'), [0, 3.5, 0]);
+      gl.uniform3fv(ul(pDirect,'uLightCol'), [10, 10, 10]);
+      gl.uniform3fv(ul(pDirect,'uAmbient'), [0.03, 0.04, 0.06]);
+      gl.bindVertexArray(qVAO); gl.drawArrays(gl.TRIANGLES, 0, 6); gl.bindVertexArray(null);
     }
   }
-  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
-  // 2. Ray-march → screen (with tone mapping)
-  gl.viewport(0,0,w,h);
-  gl.clearColor(0.05,0.05,0.05,1);
-  gl.clear(gl.COLOR_BUFFER_BIT);
-  gl.disable(gl.DEPTH_TEST);
+  // ── 3. Tetrahedral SH sphere overlay ────────────────────────────
+  if (activeSystem === 'tetrahedral') {
+    testPhi += dt * ORBIT_SPEED;
+    const testPos = [ORBIT_RADIUS * Math.cos(testPhi), 0.0, ORBIT_RADIUS * Math.sin(testPhi)];
 
-  gl.useProgram(pMarch);
-  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, scenePosTex);
-  gl.uniform1i(ul(pMarch,'uPos'),0);
-  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, sceneNrmTex);
-  gl.uniform1i(ul(pMarch,'uNrm'),1);
-  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, sceneAlbTex);
-  gl.uniform1i(ul(pMarch,'uAlb'),2);
-  gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D_ARRAY, irrArr);
-  gl.uniform1i(ul(pMarch,'uIrr'),3);
-  gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_2D_ARRAY, vsmArr);
-  gl.uniform1i(ul(pMarch,'uVSM'),4);
-  gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D_ARRAY, distHArr);
-  gl.uniform1i(ul(pMarch,'uDistH'),5);
-  gl.activeTexture(gl.TEXTURE6); gl.bindTexture(gl.TEXTURE_2D_ARRAY, distLArr);
-  gl.uniform1i(ul(pMarch,'uDistL'),6);
-
-  gl.uniform3fv(ul(pMarch,'uProbePos'), probePosFlat);
-  gl.uniform1fv(ul(pMarch,'uProbeActive'), probeActive);
-  gl.uniform3fv(ul(pMarch,'uGMin'), GMIN);
-  gl.uniform3fv(ul(pMarch,'uGMax'), GMAX);
-  gl.uniform3i(ul(pMarch,'uGridDim'), NX, NY, NZ);
-  {
-    const cy = Math.cos(yaw), sy = Math.sin(yaw);
-    const cp = Math.cos(pitch), sp = Math.sin(pitch);
-    const fwd = [cy*cp, sp, sy*cp], up = [-cy*sp, cp, -sy*sp], right = [-sy, 0, cy];
-    gl.uniform3fv(ul(pMarch, 'uCamFwd'), fwd);
-    gl.uniform3fv(ul(pMarch, 'uCamUp'), up);
-    gl.uniform3fv(ul(pMarch, 'uCamRight'), right);
+    const result = tetSys.interpolateAt(testPos);
+    if (result.tetIndex >= 0) {
+      if (Math.floor(testPhi / (Math.PI * 2) * 10) !== Math.floor((testPhi - dt * ORBIT_SPEED) / (Math.PI * 2) * 10))
+        console.log(`[TET] tet=${result.tetIndex} bary=(${result.bary.map(v=>v.toFixed(2)).join(',')}) pos=(${testPos.map(v=>v.toFixed(2)).join(',')}) sh_R0=${result.sh[0].toFixed(3)} G0=${result.sh[1].toFixed(3)} B0=${result.sh[2].toFixed(3)}`);
+      const M = new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, testPos[0],testPos[1],testPos[2],1]);
+      gl.useProgram(pSHSphere);
+      gl.uniformMatrix4fv(ul(pSHSphere,'uVP'), false, vp);
+      gl.uniformMatrix4fv(ul(pSHSphere,'uM'), false, M);
+      gl.uniform3fv(ul(pSHSphere,'uSH'), result.sh);
+      gl.uniform3fv(ul(pSHSphere,'uLightPos'), [0, 3.5, 0]);
+      gl.uniform3fv(ul(pSHSphere,'uLightCol'), [10, 10, 10]);
+      gl.uniform3fv(ul(pSHSphere,'uBaseCol'), [0.8, 0.7, 0.6]);
+      gl.bindVertexArray(shSphereVAO.vao);
+      gl.drawElements(gl.TRIANGLES, shSphereVAO.count, gl.UNSIGNED_SHORT, 0);
+      gl.bindVertexArray(null);
+    }
   }
-  gl.uniform1f(ul(pMarch, 'uTanHalfFov'), Math.tan(Math.PI/6));
-  gl.uniform1f(ul(pMarch, 'uAspect'), w/h);
-  gl.uniform1f(ul(pMarch, 'uNormalBias'), 0.03);
-  gl.uniform1f(ul(pMarch, 'uDistBias'), 0.02);
-  gl.uniform1i(ul(pMarch,'uDebug'), 0);
-  gl.uniform1i(ul(pMarch,'uSingleProbe'), singleProbe);
-
-  gl.bindVertexArray(qVAO); gl.drawArrays(gl.TRIANGLES, 0, 6); gl.bindVertexArray(null);
 
   requestAnimationFrame(renderFrame);
 }
+
+// ─── Math helpers ────────────────────────────────────────────────────
+function persp(fov,a,near,far){const f=1/Math.tan(fov/2), nf=1/(near-far); return new Float32Array([f/a,0,0,0, 0,f,0,0, 0,0,(far+near)*nf,-1, 0,0,2*far*near*nf,0]);}
+function lookAt(e,t,u){const z=norm(sub(e,t)), x=norm(cross(u,z)), y=cross(z,x); return new Float32Array([x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0, -dot(x,e),-dot(y,e),-dot(z,e),1]);}
+function norm(v){const l=Math.hypot(v[0],v[1],v[2]);return[v[0]/l,v[1]/l,v[2]/l];}
+function sub(a,b){return[a[0]-b[0],a[1]-b[1],a[2]-b[2]];}
+function cross(a,b){return[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];}
+function dot(a,b){return a[0]*b[0]+a[1]*b[1]+a[2]*b[2];}
+function mul4(a,b){const r=new Float32Array(16);for(let i=0;i<4;i++)for(let j=0;j<4;j++)r[j*4+i]=a[i]*b[j*4]+a[4+i]*b[j*4+1]+a[8+i]*b[j*4+2]+a[12+i]*b[j*4+3];return r;}
+const ID=new Float32Array([1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]);
 
 // ═══════════════════════════════════════════════════════════════════════
 //  BOOT
