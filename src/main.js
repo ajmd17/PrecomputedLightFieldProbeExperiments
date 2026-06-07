@@ -158,6 +158,7 @@ const programForward = createProgram(shaderSources.sceneGBufVert, shaderSources.
 const programProject = createProgram(shaderSources.quadVert, shaderSources.shProjectFrag);
 const programTetDebug = createProgram(shaderSources.tetDebugVert, shaderSources.tetDebugFrag);
 const programSky = createProgram(shaderSources.quadVert, shaderSources.skyFrag);
+const programShadow = createProgram(shaderSources.shadowVert, shaderSources.shadowFrag);
 
 if (
   !programScene ||
@@ -171,7 +172,8 @@ if (
   !programForward ||
   !programProject ||
   !programTetDebug ||
-  !programSky
+  !programSky ||
+  !programShadow
 ) {
   infoElement.textContent = 'Shader error';
   throw Error('shaders');
@@ -548,7 +550,7 @@ tetrahedralSystem.precompute(gl, {
   pProject: programProject,
   sceneVAOs: sceneVAOs,
   qVAO: quadVAO,
-  lightPos: [0, 3.5, 0],
+  lightPos: [0, 2.5, 0],
   lightCol: [10, 10, 10],
   cubemapResolution: 64,
   sampleCount: 512,
@@ -612,10 +614,39 @@ gl.enableVertexAttribArray(0);
 gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
 gl.bindVertexArray(null);
 
+// ─── Shadow map ──────────────────────────────────────────────────────
+const shadowMapSize = 256;
+const shadowDepthTex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_CUBE_MAP, shadowDepthTex);
+for (let i = 0; i < 6; i++) {
+  gl.texImage2D(
+    gl.TEXTURE_CUBE_MAP_POSITIVE_X + i, 0, gl.DEPTH_COMPONENT24,
+    shadowMapSize, shadowMapSize, 0, gl.DEPTH_COMPONENT, gl.UNSIGNED_INT, null
+  );
+}
+gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
+
+const shadowFBO = gl.createFramebuffer();
+gl.bindFramebuffer(gl.FRAMEBUFFER, shadowFBO);
+gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_CUBE_MAP_POSITIVE_X, shadowDepthTex, 0);
+gl.drawBuffers([gl.NONE]);
+gl.readBuffer(gl.NONE);
+gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+const shadowLightPos = [0, 3.5, 0];
+const shadowLightNear = 0.1;
+const shadowLightFar = 50;
+const shadowFaceDirs = [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]];
+const shadowFaceUps = [[0,-1,0],[0,-1,0],[0,0,1],[0,0,-1],[0,-1,0],[0,-1,0]];
 // Which system is active
 let activeSystem = 'tetrahedral';
 let lfpReady = false;
 let showIndirect = false;
+let hideIndirect = false;
 let showDebug = true;
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -677,6 +708,7 @@ function updateInfoText() {
   const probeSuffix = singleProbe >= 0 ? ` [probe:${singleProbe}]` : '';
   const systemLabel = activeSystem === 'lightfield' ? 'LFP' : 'TET';
   const indirectFlag = showIndirect ? ' [IRR]' : '';
+  const noIndirectFlag = hideIndirect ? ' [NO_IND]' : '';
   const debugFlag = showDebug ? ' [DBG]' : '';
   const totalProbes = tetrahedralSystem.probes.length;
   const totalTets = tetrahedralSystem.tets.length;
@@ -685,7 +717,7 @@ function updateInfoText() {
   } else {
     infoElement.textContent =
       `${systemLabel} | ${totalProbes} probes ${totalTets} tets` +
-      probeSuffix + indirectFlag + debugFlag;
+      probeSuffix + indirectFlag + noIndirectFlag + debugFlag;
   }
 }
 
@@ -728,6 +760,9 @@ document.addEventListener('keydown', event => {
   } else if (event.code === 'KeyU') {
     showDebug = !showDebug;
     console.log(`[TET] showDebug=${showDebug}`);
+  } else if (event.code === 'KeyK') {
+    hideIndirect = !hideIndirect;
+    console.log(`[TET] hideIndirect=${hideIndirect}`);
   }
   updateInfoText();
 });
@@ -812,6 +847,46 @@ function renderFrame(timestamp) {
   );
   const viewProjectionMatrix = multiplyMatrices4(projectionMatrix, viewMatrix);
 
+  // ── 0. Shadow map render (disabled) ──────────────────────────────
+  /*
+    gl.bindFramebuffer(gl.FRAMEBUFFER, shadowFBO);
+    gl.viewport(0, 0, shadowMapSize, shadowMapSize);
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthFunc(gl.LEQUAL);
+    gl.depthMask(true);
+    gl.clearDepth(1);
+    gl.useProgram(programShadow);
+
+    const shadowProj = perspectiveMatrix(Math.PI / 2, 1, shadowLightNear, shadowLightFar);
+    gl.uniform3fv(getUniformLocation(programShadow, 'uLightPos'), shadowLightPos);
+    gl.uniform1f(getUniformLocation(programShadow, 'uShadowFar'), shadowLightFar);
+
+    for (let face = 0; face < 6; face++) {
+      gl.framebufferTexture2D(
+        gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT,
+        gl.TEXTURE_CUBE_MAP_POSITIVE_X + face, shadowDepthTex, 0
+      );
+      gl.clear(gl.DEPTH_BUFFER_BIT);
+
+      const lookDir = shadowFaceDirs[face];
+      const lookAtPos = [
+        shadowLightPos[0] + lookDir[0],
+        shadowLightPos[1] + lookDir[1],
+        shadowLightPos[2] + lookDir[2],
+      ];
+      const lightView = lookAtMatrix(shadowLightPos, lookAtPos, shadowFaceUps[face]);
+      const lightVP = multiplyMatrices4(shadowProj, lightView);
+      gl.uniformMatrix4fv(getUniformLocation(programShadow, 'uLightVP'), false, lightVP);
+
+      for (const meshVAO of sceneVAOs) {
+        gl.uniformMatrix4fv(getUniformLocation(programShadow, 'uM'), false, identityMatrix);
+        gl.bindVertexArray(meshVAO.vao);
+        gl.drawElements(gl.TRIANGLES, meshVAO.count, gl.UNSIGNED_SHORT, 0);
+        gl.bindVertexArray(null);
+      }
+    }
+  }
+  */
   // ── 1. Forward render (tetrahedral mode) ──────────────────────
   if (activeSystem === 'tetrahedral') {
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -861,6 +936,10 @@ function renderFrame(timestamp) {
       getUniformLocation(programForward, 'uShowIndirect'),
       showIndirect ? 1 : 0
     );
+    gl.uniform1f(
+      getUniformLocation(programForward, 'uHideIndirect'),
+      hideIndirect ? 1 : 0
+    );
     gl.uniform3fv(
       getUniformLocation(programForward, 'uCameraPos'),
       cameraPosition
@@ -873,6 +952,15 @@ function renderFrame(timestamp) {
       getUniformLocation(programForward, 'uSpecularStrength'),
       0.5
     );
+    // Shadow map uniforms (disabled)
+    /*
+    gl.activeTexture(gl.TEXTURE7);
+    gl.bindTexture(gl.TEXTURE_CUBE_MAP, shadowDepthTex);
+    gl.uniform1i(getUniformLocation(programForward, 'uShadowMap'), 7);
+    gl.uniform1f(getUniformLocation(programForward, 'uShadowMapSize'), shadowMapSize);
+    gl.uniform1f(getUniformLocation(programForward, 'uShadowBias'), 0.005);
+    gl.uniform1f(getUniformLocation(programForward, 'uShadowFar'), shadowLightFar);
+    */
 
     for (let meshIndex = 0; meshIndex < sceneMeshes.length; meshIndex++) {
       gl.uniform3fv(

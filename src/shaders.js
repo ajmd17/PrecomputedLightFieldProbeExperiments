@@ -514,7 +514,34 @@ void main() {
 }
 `;
 
-// ─── Forward lit (per-mesh SH for tetrahedral mode) ─────────────
+// ─── Shadow map depth pass ────────────────────────────────────────
+export const shadowVert = `#version 300 es
+precision highp float;
+layout(location=0) in vec3 aPos;
+uniform mat4 uM;
+uniform mat4 uLightVP;
+uniform vec3 uLightPos;
+uniform float uShadowFar;
+out vec3 vWorldPos;
+void main() {
+  vec4 wp = uM * vec4(aPos, 1);
+  vWorldPos = wp.xyz;
+  gl_Position = uLightVP * wp;
+}
+`;
+
+export const shadowFrag = `#version 300 es
+precision highp float;
+in vec3 vWorldPos;
+uniform vec3 uLightPos;
+uniform float uShadowFar;
+void main() {
+  float dist = length(vWorldPos - uLightPos);
+  gl_FragDepth = dist / uShadowFar;
+}
+`;
+
+// ─── Sky background ───────────────────────────────────────────────
 
 export const skyFrag = `#version 300 es
 precision highp float;
@@ -549,8 +576,14 @@ uniform vec3 uLightPos;
 uniform vec3 uLightCol;
 uniform vec3 uCameraPos;
 uniform float uShowIndirect;
+uniform float uHideIndirect;
 uniform float uSpecularPower;
 uniform float uSpecularStrength;
+// Shadow map uniforms (disabled)
+//uniform highp samplerCube uShadowMap;
+//uniform float uShadowMapSize;
+//uniform float uShadowBias;
+//uniform float uShadowFar;
 layout(location=0) out vec4 fColor;
 
 vec3 evalSH(vec3 dir) {
@@ -575,16 +608,44 @@ void main() {
   float NdotL = max(0.0, dot(N, L));
   float NdotH = max(0.0, dot(N, H));
   float spec = pow(NdotH, uSpecularPower) * uSpecularStrength;
+
+  // Shadow from point light (disabled)
+  /*
+  vec3 lightToPoint = vW - uLightPos;
+  float currentDepth = length(lightToPoint);
+  vec3 shadowDir = lightToPoint / currentDepth;
+  float closestDepth = texture(uShadowMap, shadowDir).r;
+  float closestDist = closestDepth * uShadowFar;
+  float shadowBias = uShadowBias * (1.0 - NdotL);
+  float shadow = step(currentDepth - shadowBias, closestDist);
+
+  vec3 upVec = abs(shadowDir.y) < 0.999 ? vec3(0, 1, 0) : vec3(1, 0, 0);
+  vec3 tangent1 = normalize(cross(upVec, shadowDir));
+  vec3 tangent2 = cross(shadowDir, tangent1);
+  float pcfSum = shadow;
+  float pcfScale = 1.0 / uShadowMapSize * 2.5;
+  for (int x = -1; x <= 1; x++) {
+    for (int y = -1; y <= 1; y++) {
+      if (x == 0 && y == 0) continue;
+      vec3 offsetDir = normalize(shadowDir + tangent1 * float(x) * pcfScale + tangent2 * float(y) * pcfScale);
+      float d = texture(uShadowMap, offsetDir).r;
+      pcfSum += step(currentDepth - shadowBias, d * uShadowFar);
+    }
+  }
+  shadow = pcfSum / 9.0;
+  */
+  float shadow = 1.0;
+
   float distL = length(uLightPos - vW);
   float atten = min(1.0 / (1.0 + distL * distL * 0.05), 1.0);
-  vec3 diffuse = uLightCol * NdotL * atten;
-  vec3 specular = uLightCol * spec * atten;
+  vec3 diffuse = uLightCol * NdotL * atten * shadow;
+  vec3 specular = uLightCol * spec * atten * shadow;
   vec3 indirect = evalSH(N);
   vec3 color;
   if (uShowIndirect > 0.5) {
     color = indirect;
   } else {
-    color = vC * (diffuse + indirect) + specular;
+    color = vC * (diffuse + indirect * (1.0 - uHideIndirect)) + specular;
   }
   fColor = vec4(color / (1.0 + color), 1.0);
 }
