@@ -304,7 +304,7 @@ function renderProbeGB(gb, pp) {
   gl.useProgram(pProbe);
   gl.uniform3fv(ul(pProbe, 'uQ'), pp);
   gl.uniform3fv(ul(pProbe, 'uLightPos'), [0, 3.5, 0]);
-  gl.uniform3fv(ul(pProbe, 'uLightCol'), [20, 20, 20]);
+  gl.uniform3fv(ul(pProbe, 'uLightCol'), [10, 10, 10]);
   gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL); gl.disable(gl.CULL_FACE);
   const blk = new Float32Array([0, 0, 0, 1]);
   const farDist = new Float32Array([20, 0, 0, 0]);

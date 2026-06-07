@@ -335,11 +335,11 @@ void main() {
     vec3 Q = uProbePos[i];
     vec3 dQ = normalize(Q - P);
     float bf = (dot(N, dQ) + 0.2) / 1.2;
-    bf = max(0.001, bf);
+    bf = max(0.0, bf);
     int steps;
     float vis = probeVis(P + N * uNormalBias, Q, i, steps);
     maxSteps = steps;
-    vis = max(0.001, vis);
+    vis = max(0.0, vis);
     vec3 irr = texture(uIrr, vec3(nOct, i)).rgb;
     float w = bf * vis;
     indirect += irr * w; tw += w; norm += 1.0;
@@ -356,11 +356,11 @@ void main() {
       float radial = smoothstep(0.0, 0.4, length(P - Q));
       vec3 dQ = normalize(Q - P);
       float bf = (dot(N, dQ) + 0.2) / 1.2;
-      bf = max(0.001, bf);
+      bf = max(0.0, bf);
       int steps;
       float vis = probeVis(P + N * uNormalBias, Q, i, steps);
       if (steps > maxSteps) maxSteps = steps;
-      vis = max(0.001, vis);
+      vis = max(0.0, vis);
       vec3 irr = texture(uIrr, vec3(nOct, i)).rgb;
       float w = bf * vis * weight;
       indirect += irr * w; tw += w; norm += weight;
@@ -393,10 +393,10 @@ void main() {
     return;
   }
 
-  if (norm < 0.0001) {
-    indirect = (twTri > 0.0) ? (indirectTri / twTri) : vec3(0.0);
+  if (tw < 0.0001) {
+    indirect = vec3(0.0);
   } else {
-    indirect /= norm;
+    indirect /= tw;
   }
   vec3 color = indirect * albedo;
   fColor = vec4(color / (1.0 + color), 1.0);
