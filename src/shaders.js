@@ -290,7 +290,7 @@ void main() {
     vec3 Q = uProbePos[i];
     vec3 dQ = normalize(Q - P);
 
-    // Backface test: max(0, n_surf · (p_probe − p_surf) / |p_probe − p_surf|)
+    // Backface test: max(0, n_surf · (p_probe - p_surf) / |p_probe - p_surf|)
     float bf = max(0.0, dot(N, dQ));
     if (bf < 0.001) continue;
 
