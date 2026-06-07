@@ -1,520 +1,437 @@
-import * as shaders from './shaders.js';
+import * as S from './shaders.js';
 
 const RES = 256;
 const OCT_RES = 256;
+const LOW_RES = 64;
 const NUM_PROBES = 8;
 
-const info = document.getElementById('info');
+const $ = document.getElementById.bind(document);
+const info = $('info');
+const canvas = $('glcanvas');
 
 // ─── WebGL 2.0 Context ───────────────────────────────────────────────
-const canvas = document.getElementById('glcanvas');
 canvas.width = canvas.clientWidth * devicePixelRatio;
 canvas.height = canvas.clientHeight * devicePixelRatio;
-
 const gl = canvas.getContext('webgl2', { alpha: false });
-if (!gl) {
-  info.textContent = 'ERROR: WebGL 2.0 not supported';
-  throw new Error('WebGL 2.0 required');
-}
+if (!gl) { info.textContent = 'ERROR: no WebGL 2.0'; throw Error(''); }
 info.textContent = 'WebGL 2.0 OK';
+gl.getExtension('EXT_color_buffer_float');
+gl.getExtension('OES_texture_float_linear');
 
-// ─── Extension Checks ────────────────────────────────────────────────
-const extFloat = gl.getExtension('EXT_color_buffer_float');
-if (!extFloat) {
-  info.textContent = 'WARNING: EXT_color_buffer_float missing';
+// ─── Helpers ─────────────────────────────────────────────────────────
+const cs = (s, t) => { const a = gl.createShader(t); gl.shaderSource(a, s); gl.compileShader(a); if (!gl.getShaderParameter(a, gl.COMPILE_STATUS)) { console.error(gl.getShaderInfoLog(a)); gl.deleteShader(a); return null; } return a; };
+const mkProg = (v, f) => { const a = cs(v, gl.VERTEX_SHADER), b = cs(f, gl.FRAGMENT_SHADER); if (!a||!b) return null; const p = gl.createProgram(); gl.attachShader(p, a); gl.attachShader(p, b); gl.linkProgram(p); if (!gl.getProgramParameter(p, gl.LINK_STATUS)) { console.error(gl.getProgramInfoLog(p)); return null; } return p; };
+const ul = (p, n) => gl.getUniformLocation(p, n);
+
+// ─── Textures ────────────────────────────────────────────────────────
+function cmF16(w, h) {
+  const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_CUBE_MAP, t);
+  for (let i = 0; i < 6; i++) gl.texImage2D(gl.TEXTURE_CUBE_MAP_POSITIVE_X+i, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.HALF_FLOAT, null);
+  const p = (n, v) => gl.texParameteri(gl.TEXTURE_CUBE_MAP, n, v);
+  p(gl.TEXTURE_MIN_FILTER, gl.LINEAR); p(gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  p(gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); p(gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE); p(gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
+  return t;
+}
+function cmR16F(w, h) {
+  const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_CUBE_MAP, t);
+  for (let i = 0; i < 6; i++) gl.texImage2D(gl.TEXTURE_CUBE_MAP_POSITIVE_X+i, 0, gl.R16F, w, h, 0, gl.RED, gl.HALF_FLOAT, null);
+  const p = (n, v) => gl.texParameteri(gl.TEXTURE_CUBE_MAP, n, v);
+  p(gl.TEXTURE_MIN_FILTER, gl.NEAREST); p(gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  p(gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); p(gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE); p(gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
+  return t;
+}
+function t2D(w, h, ch) {
+  const c = ch||4; const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, c===1?gl.R16F:gl.RGBA16F, w, h, 0, c===1?gl.RED:gl.RGBA, gl.HALF_FLOAT, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return t;
+}
+function t2DA(w, h, layers, ch, filter) {
+  const f = filter || gl.LINEAR;
+  const c = ch||4; const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D_ARRAY, t);
+  const fmt = c===1 ? gl.R16F : c===2 ? gl.RG32F : gl.RGBA16F;
+  gl.texStorage3D(gl.TEXTURE_2D_ARRAY, 1, fmt, w, h, layers);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, f);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, f);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return t;
 }
 
-console.log(`MAX_DRAW_BUFFERS: ${gl.getParameter(gl.MAX_DRAW_BUFFERS)}`);
-console.log(`MAX_COLOR_ATTACHMENTS: ${gl.getParameter(gl.MAX_COLOR_ATTACHMENTS)}`);
+// ─── Programs ────────────────────────────────────────────────────────
+const pScene = mkProg(S.sceneGBufVert, S.sceneGBufFrag);
+const pProbe = mkProg(S.probeGBufVert, S.probeGBufFrag);
+const pOct   = mkProg(S.quadVert, S.octFrag);
+const pIrr   = mkProg(S.quadVert, S.irrFrag);
+const pVSM   = mkProg(S.quadVert, S.vsmFrag);
+const pMarch = mkProg(S.quadVert, S.raymarchFrag);
+if (!pScene||!pProbe||!pOct||!pIrr||!pVSM||!pMarch) { info.textContent='Shader error'; throw Error('shaders'); }
+info.textContent='Shaders OK';
 
-// ─── Shader Compilation ──────────────────────────────────────────────
-function compileShader(src, type) {
-  const s = gl.createShader(type);
-  gl.shaderSource(s, src);
-  gl.compileShader(s);
-  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
-    console.error('Shader compile error:', gl.getShaderInfoLog(s));
-    gl.deleteShader(s);
-    return null;
-  }
-  return s;
-}
-
-function createProgram(vsSrc, fsSrc) {
-  const vs = compileShader(vsSrc, gl.VERTEX_SHADER);
-  const fs = compileShader(fsSrc, gl.FRAGMENT_SHADER);
-  if (!vs || !fs) return null;
-  const prog = gl.createProgram();
-  gl.attachShader(prog, vs);
-  gl.attachShader(prog, fs);
-  gl.linkProgram(prog);
-  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
-    console.error('Program link error:', gl.getProgramInfoLog(prog));
-    return null;
-  }
-  return prog;
-}
-
-function uniformLoc(prog, name) {
-  const loc = gl.getUniformLocation(prog, name);
-  if (loc === null) console.warn(`Uniform ${name} not found in program`);
-  return loc;
-}
-
-// ─── Texture Creation ────────────────────────────────────────────────
-function createCubemapF16(w, h) {
-  const tex = gl.createTexture();
-  gl.bindTexture(gl.TEXTURE_CUBE_MAP, tex);
-  for (let i = 0; i < 6; i++) {
-    gl.texImage2D(
-      gl.TEXTURE_CUBE_MAP_POSITIVE_X + i, 0,
-      gl.RGBA16F, w, h, 0,
-      gl.RGBA, gl.HALF_FLOAT, null
-    );
-  }
-  gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
-  return tex;
-}
-
-function createCubemapR16F(w, h) {
-  const tex = gl.createTexture();
-  gl.bindTexture(gl.TEXTURE_CUBE_MAP, tex);
-  for (let i = 0; i < 6; i++) {
-    gl.texImage2D(
-      gl.TEXTURE_CUBE_MAP_POSITIVE_X + i, 0,
-      gl.R16F, w, h, 0,
-      gl.RED, gl.HALF_FLOAT, null
-    );
-  }
-  gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
-  return tex;
-}
-
-function createTexture2DF16(w, h, channels) {
-  const ch = channels || 4;
-  const ifmt = ch === 1 ? gl.R16F : gl.RGBA16F;
-  const fmt  = ch === 1 ? gl.RED  : gl.RGBA;
-  const tex = gl.createTexture();
-  gl.bindTexture(gl.TEXTURE_2D, tex);
-  gl.texImage2D(gl.TEXTURE_2D, 0, ifmt, w, h, 0, fmt, gl.HALF_FLOAT, null);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-  return tex;
-}
-
-// ─── MRT G-Buffer Framebuffer ────────────────────────────────────────
-function createGBufferFBO(w, h) {
-  const radianceCM = createCubemapF16(w, h);
-  const normalCM   = createCubemapF16(w, h);
-  const distanceCM = createCubemapR16F(w, h);
-  const fbo = gl.createFramebuffer();
-  return { fbo, radianceCM, normalCM, distanceCM };
-}
-
-const drawBuf3 = [
-  gl.COLOR_ATTACHMENT0,
-  gl.COLOR_ATTACHMENT1,
-  gl.COLOR_ATTACHMENT2,
-];
-
-function bindGBufferFace(fbo, face, radianceCM, normalCM, distanceCM) {
-  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
-  const target = gl.TEXTURE_CUBE_MAP_POSITIVE_X + face;
-  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, target, radianceCM, 0);
-  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, target, normalCM,   0);
-  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT2, target, distanceCM, 0);
-  gl.drawBuffers(drawBuf3);
-  const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
-  if (status !== gl.FRAMEBUFFER_COMPLETE) {
-    console.error(`FBO incomplete for face ${face}: ${status}`);
-  }
-}
-
-// ─── Octahedral Map Framebuffer (3 MRT targets) ──────────────────────
-function createOctahedralFBO(w, h) {
-  const radiance2D = createTexture2DF16(w, h);
-  const normal2D   = createTexture2DF16(w, h);
-  const distance2D = createTexture2DF16(w, h, 1);
-  const fbo = gl.createFramebuffer();
-  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
-  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, radiance2D, 0);
-  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, normal2D,   0);
-  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT2, gl.TEXTURE_2D, distance2D, 0);
-  gl.drawBuffers(drawBuf3);
-  const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
-  if (status !== gl.FRAMEBUFFER_COMPLETE) console.error('Oct FBO incomplete');
-  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-  return { fbo, radiance2D, normal2D, distance2D };
-}
-
-// ─── Single-target Filter Framebuffer ────────────────────────────────
-function createFilterFBO(w, h, channels) {
-  const tex = createTexture2DF16(w, h, channels);
-  const fbo = gl.createFramebuffer();
-  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
-  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
-  gl.drawBuffers([gl.COLOR_ATTACHMENT0]);
-  const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
-  if (status !== gl.FRAMEBUFFER_COMPLETE) console.error('Filter FBO incomplete');
-  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-  return { fbo, tex };
-}
-
-// ─── Compile Shaders ─────────────────────────────────────────────────
-const progGBuffer    = createProgram(shaders.gbufferVert, shaders.gbufferFrag);
-const progOctahedral = createProgram(shaders.octahedralVert, shaders.octahedralFrag);
-const progIrradiance = createProgram(shaders.octahedralVert, shaders.irradianceFilterFrag);
-const progVSM        = createProgram(shaders.octahedralVert, shaders.varianceShadowFrag);
-
-if (!progGBuffer || !progOctahedral || !progIrradiance || !progVSM) {
-  info.textContent = 'ERROR: shader compilation failed';
-  throw new Error('Shader compilation failed');
-}
-info.textContent = 'Shaders compiled OK';
-
-// ─── Full-Screen Quad (for octahedral / filter passes) ──────────────
-const quadVerts = new Float32Array([
-  -1, -1,   1, -1,   1,  1,
-  -1, -1,   1,  1,  -1,  1,
-]);
-const quadVAO = gl.createVertexArray();
-gl.bindVertexArray(quadVAO);
-const quadBuf = gl.createBuffer();
-gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
-gl.bufferData(gl.ARRAY_BUFFER, quadVerts, gl.STATIC_DRAW);
-gl.enableVertexAttribArray(0);
-gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+// ─── Full-screen quad ────────────────────────────────────────────────
+const qVAO = gl.createVertexArray(); gl.bindVertexArray(qVAO);
+const qB = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, qB);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, 1,1, -1,-1, 1,1, -1,1]), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
 gl.bindVertexArray(null);
 
-// ─── Probe Data ──────────────────────────────────────────────────────
-const probeData = [];
-for (let i = 0; i < NUM_PROBES; i++) {
-  probeData.push({
-    gbuf: createGBufferFBO(RES, RES),
-    oct:  createOctahedralFBO(OCT_RES * 2, OCT_RES),
-    irr:  createFilterFBO(OCT_RES * 2, OCT_RES),
-    vsm:  createFilterFBO(OCT_RES * 2, OCT_RES, 2), // RG = depth, variance
-  });
-}
-
-// ─── Scene Geometry (Cornell Box) ────────────────────────────────────
-function makeBox(cx, cy, cz, sx, sy, sz, r, g, b) {
-  const hx = sx / 2, hy = sy / 2, hz = sz / 2;
+// ─── Scene meshes ────────────────────────────────────────────────────
+function box(cx,cy,cz, sx,sy,sz, r,g,b) {
+  const hx=sx/2, hy=sy/2, hz=sz/2;
   const p = [
-    // Order: front, back, left, right, top, bottom
-    // Each face: 4 verts (CCW when viewed from outside)
-    cx-hx, cy-hy, cz+hz,  cx+hx, cy-hy, cz+hz,  cx+hx, cy+hy, cz+hz,  cx-hx, cy+hy, cz+hz,
-    cx+hx, cy-hy, cz-hz,  cx-hx, cy-hy, cz-hz,  cx-hx, cy+hy, cz-hz,  cx+hx, cy+hy, cz-hz,
-    cx-hx, cy-hy, cz-hz,  cx-hx, cy-hy, cz+hz,  cx-hx, cy+hy, cz+hz,  cx-hx, cy+hy, cz-hz,
-    cx+hx, cy-hy, cz+hz,  cx+hx, cy-hy, cz-hz,  cx+hx, cy+hy, cz-hz,  cx+hx, cy+hy, cz+hz,
-    cx-hx, cy+hy, cz-hz,  cx+hx, cy+hy, cz-hz,  cx+hx, cy+hy, cz+hz,  cx-hx, cy+hy, cz+hz,
-    cx-hx, cy-hy, cz+hz,  cx+hx, cy-hy, cz+hz,  cx+hx, cy-hy, cz-hz,  cx-hx, cy-hy, cz-hz,
+    cx-hx,cy-hy,cz+hz, cx+hx,cy-hy,cz+hz, cx+hx,cy+hy,cz+hz, cx-hx,cy+hy,cz+hz,
+    cx+hx,cy-hy,cz-hz, cx-hx,cy-hy,cz-hz, cx-hx,cy+hy,cz-hz, cx+hx,cy+hy,cz-hz,
+    cx-hx,cy-hy,cz-hz, cx-hx,cy-hy,cz+hz, cx-hx,cy+hy,cz+hz, cx-hx,cy+hy,cz-hz,
+    cx+hx,cy-hy,cz+hz, cx+hx,cy-hy,cz-hz, cx+hx,cy+hy,cz-hz, cx+hx,cy+hy,cz+hz,
+    cx-hx,cy+hy,cz-hz, cx+hx,cy+hy,cz-hz, cx+hx,cy+hy,cz+hz, cx-hx,cy+hy,cz+hz,
+    cx-hx,cy-hy,cz+hz, cx+hx,cy-hy,cz+hz, cx+hx,cy-hy,cz-hz, cx-hx,cy-hy,cz-hz,
   ];
-  const n = [];
-  const faceNormals = [
-    [0,0,1], [0,0,-1], [-1,0,0], [1,0,0], [0,1,0], [0,-1,0]
-  ];
-  for (const fn of faceNormals)
-    for (let j = 0; j < 4; j++)
-      n.push(fn[0], fn[1], fn[2]);
-
-  // Indices: 2 triangles per face (CCW winding)
-  const idx = [];
-  for (let f = 0; f < 6; f++) {
-    const base = f * 4;
-    idx.push(base, base+1, base+2, base, base+2, base+3);
-  }
-  return { pos: p, nrm: n, color: [r, g, b], idx };
+  const fn = [[0,0,1],[0,0,-1],[-1,0,0],[1,0,0],[0,1,0],[0,-1,0]];
+  const n = []; for (const f of fn) for (let j=0;j<4;j++) n.push(f[0],f[1],f[2]);
+  const idx = []; for (let f=0;f<6;f++) { const b=f*4; idx.push(b,b+1,b+2,b,b+2,b+3); }
+  return {pos:p, nrm:n, col:[r,g,b], idx};
 }
-
-const meshes = [
-  makeBox(0, -4, 0, 10, 0.5, 10, 0.9, 0.9, 0.9),     // floor
-  makeBox(-5, 0, 0, 0.5, 8, 10, 1.0, 0.2, 0.2),      // left wall (red)
-  makeBox(5, 0, 0, 0.5, 8, 10, 0.2, 0.2, 1.0),       // right wall (blue)
-  makeBox(0, 0, -5, 10, 8, 0.5, 0.8, 0.8, 0.8),      // back wall
-  makeBox(0, 4, 0, 10, 0.5, 10, 0.6, 0.6, 0.6),      // ceiling
-  makeBox(-2, -3, 0, 2, 2, 2, 0.1, 0.9, 0.1),        // green cube
-  makeBox(2.5, -2.5, -2, 1.5, 3, 1.5, 1.0, 0.6, 0.1),// orange cube
-  makeBox(0, 3.5, 0, 4, 0.2, 4, 5.0, 5.0, 5.0),     // light (emissive)
+const M = [
+  box(0,-4,0, 10,0.5,10, 0.9,0.9,0.9),
+  box(-5,0,0, 0.5,8,10, 1.0,0.2,0.2),
+  box(5,0,0, 0.5,8,10, 0.2,0.2,1.0),
+  box(0,0,-5, 10,8,0.5, 0.8,0.8,0.8),
+  box(0,4,0, 10,0.5,10, 0.6,0.6,0.6),
+  box(-2,-3,0, 2,2,2, 0.1,0.9,0.1),
+  box(2.5,-2.5,-2, 1.5,3,1.5, 1.0,0.6,0.1),
+  box(0,3.5,0, 4,0.2,4, 5.0,5.0,5.0),
 ];
-
-// Upload each mesh as its own VAO (self-contained, indices start at 0)
-function uploadScene() {
-  const list = [];
-  for (const m of meshes) {
-    const vertCount = m.pos.length / 3;
-    const posBuf = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(m.pos), gl.STATIC_DRAW);
-
-    const nrmBuf = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, nrmBuf);
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(m.nrm), gl.STATIC_DRAW);
-
-    const colData = new Float32Array(vertCount * 3);
-    for (let i = 0; i < vertCount; i++) {
-      colData[i*3] = m.color[0]; colData[i*3+1] = m.color[1]; colData[i*3+2] = m.color[2];
-    }
-    const colBuf = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, colBuf);
-    gl.bufferData(gl.ARRAY_BUFFER, colData, gl.STATIC_DRAW);
-
-    const idxBuf = gl.createBuffer();
-    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf);
-    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(m.idx), gl.STATIC_DRAW);
-
-    const vao = gl.createVertexArray();
-    gl.bindVertexArray(vao);
-    gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
-    gl.enableVertexAttribArray(0);
-    gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
-    gl.bindBuffer(gl.ARRAY_BUFFER, nrmBuf);
-    gl.enableVertexAttribArray(1);
-    gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
-    gl.bindBuffer(gl.ARRAY_BUFFER, colBuf);
-    gl.enableVertexAttribArray(2);
-    gl.vertexAttribPointer(2, 3, gl.FLOAT, false, 0, 0);
-    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf);
+const sceneVAOs = (() => {
+  const r = [];
+  for (const m of M) {
+    const vc = m.pos.length/3;
+    const pb=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,pb); gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(m.pos),gl.STATIC_DRAW);
+    const nb=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,nb); gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(m.nrm),gl.STATIC_DRAW);
+    const cd=new Float32Array(vc*3); for(let i=0;i<vc;i++){cd[i*3]=m.col[0];cd[i*3+1]=m.col[1];cd[i*3+2]=m.col[2];}
+    const cb=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,cb); gl.bufferData(gl.ARRAY_BUFFER,cd,gl.STATIC_DRAW);
+    const ib=gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,ib); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,new Uint16Array(m.idx),gl.STATIC_DRAW);
+    const vao=gl.createVertexArray(); gl.bindVertexArray(vao);
+    gl.bindBuffer(gl.ARRAY_BUFFER,pb); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0,3,gl.FLOAT,false,0,0);
+    gl.bindBuffer(gl.ARRAY_BUFFER,nb); gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1,3,gl.FLOAT,false,0,0);
+    gl.bindBuffer(gl.ARRAY_BUFFER,cb); gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2,3,gl.FLOAT,false,0,0);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,ib);
     gl.bindVertexArray(null);
-
-    list.push({ vao, count: m.idx.length });
+    r.push({vao, count:m.idx.length});
   }
-  return list;
-}
-const sceneVAOs = uploadScene();
-
-// ─── Math Helpers ────────────────────────────────────────────────────
-function perspective(fovY, aspect, near, far) {
-  const f = 1.0 / Math.tan(fovY / 2);
-  const nf = 1 / (near - far);
-  return new Float32Array([
-    f/aspect, 0, 0, 0,
-    0, f, 0, 0,
-    0, 0, (far + near) * nf, -1,
-    0, 0, 2 * far * near * nf, 0,
-  ]);
-}
-
-function lookAt(eye, target, up) {
-  const z = normalize(sub(eye, target));
-  const x = normalize(cross(up, z));
-  const y = cross(z, x);
-  return new Float32Array([
-    x[0], y[0], z[0], 0,
-    x[1], y[1], z[1], 0,
-    x[2], y[2], z[2], 0,
-    -dot(x, eye), -dot(y, eye), -dot(z, eye), 1,
-  ]);
-}
-
-function normalize(v) { const l = Math.sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]); return [v[0]/l, v[1]/l, v[2]/l]; }
-function sub(a, b) { return [a[0]-b[0], a[1]-b[1], a[2]-b[2]]; }
-function cross(a, b) { return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]; }
-function dot(a, b) { return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]; }
-
-function mul(a, b) {
-  const r = new Float32Array(16);
-  for (let i = 0; i < 4; i++)
-    for (let j = 0; j < 4; j++)
-      r[j*4+i] = a[i]*b[j*4] + a[4+i]*b[j*4+1] + a[8+i]*b[j*4+2] + a[12+i]*b[j*4+3];
   return r;
+})();
+
+// ─── Probe grid ──────────────────────────────────────────────────────
+const GMIN = [-4.0, -5.0, -3.5], GMAX = [4.0, 3.0, 2.0];
+const probePos = Array.from({length:NUM_PROBES}, (_,i)=>{
+  const nx=2,ny=2,nz=2, ix=i%nx, iy=Math.floor(i/nx)%ny, iz=Math.floor(i/(nx*ny));
+  const tx=ix/(nx-1), ty=iy/(ny-1), tz=iz/(nz-1);
+  return [GMIN[0]+tx*(GMAX[0]-GMIN[0]), GMIN[1]+ty*(GMAX[1]-GMIN[1]), GMIN[2]+tz*(GMAX[2]-GMIN[2])];
+});
+const probePosFlat = new Float32Array(probePos.flat());
+
+// ─── Probe G-buffer cubemaps (with depth cubemap) ────────────────────
+const probeGB = [];
+for (let i = 0; i < NUM_PROBES; i++) {
+  const depthCM = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_CUBE_MAP, depthCM);
+  for (let j = 0; j < 6; j++) gl.texImage2D(gl.TEXTURE_CUBE_MAP_POSITIVE_X+j, 0, gl.DEPTH_COMPONENT24, RES, RES, 0, gl.DEPTH_COMPONENT, gl.UNSIGNED_INT, null);
+  gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
+  probeGB.push({ fbo:gl.createFramebuffer(), rad:cmF16(RES,RES), nrm:cmF16(RES,RES), dist:cmR16F(RES,RES), depthCM });
+}
+const db3 = [gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1, gl.COLOR_ATTACHMENT2];
+function bindGBFace(fbo, face, r, n, d, depth) {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  const t = gl.TEXTURE_CUBE_MAP_POSITIVE_X + face;
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, t, r, 0);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, t, n, 0);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT2, t, d, 0);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, t, depth, 0);
+  gl.drawBuffers(db3);
 }
 
-const CUBE_TARGETS = [
-  [ 1, 0, 0], [-1, 0, 0],
-  [ 0, 1, 0], [ 0,-1, 0],
-  [ 0, 0, 1], [ 0, 0,-1],
-];
-const CUBE_UPS = [
-  [0,-1,0], [0,-1,0],
-  [0, 0,1], [0, 0,-1],
-  [0,-1,0], [0,-1,0],
-];
+// ─── Texture arrays ──────────────────────────────────────────────────
+const OW = OCT_RES*2, OH = OCT_RES;
+const LW = LOW_RES*2, LH = LOW_RES;
+const irrArr = t2DA(OW, OH, NUM_PROBES);
+const vsmArr = t2DA(OW, OH, NUM_PROBES, 2, gl.LINEAR);
+const distHArr = t2DA(OW, OH, NUM_PROBES, 1, gl.NEAREST);
+const distLArr = t2DA(LW, LH, NUM_PROBES, 1, gl.NEAREST);
 
-const IDENTITY = new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]);
+const layerFBO = gl.createFramebuffer();
 
-// ─── Render G-Buffer (cubemap with MRT) ──────────────────────────────
-function renderGBuffer(probeIdx) {
-  const probePos = [(probeIdx % 4) * 2.5 - 3.75, 0, Math.floor(probeIdx / 4) * 2.5 - 1.25];
-  const gbuf = probeData[probeIdx].gbuf;
-  const proj = perspective(Math.PI / 2, 1, 0.1, 20);
+// ─── Math ────────────────────────────────────────────────────────────
+function persp(fov,a,near,far){const f=1/Math.tan(fov/2), nf=1/(near-far); return new Float32Array([f/a,0,0,0, 0,f,0,0, 0,0,(far+near)*nf,-1, 0,0,2*far*near*nf,0]);}
+function lookAt(e,t,u){const z=norm(sub(e,t)), x=norm(cross(u,z)), y=cross(z,x); return new Float32Array([x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0, -dot(x,e),-dot(y,e),-dot(z,e),1]);}
+function norm(v){const l=Math.hypot(v[0],v[1],v[2]);return[v[0]/l,v[1]/l,v[2]/l];}
+function sub(a,b){return[a[0]-b[0],a[1]-b[1],a[2]-b[2]];}
+function cross(a,b){return[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];}
+function dot(a,b){return a[0]*b[0]+a[1]*b[1]+a[2]*b[2];}
+function mul4(a,b){const r=new Float32Array(16);for(let i=0;i<4;i++)for(let j=0;j<4;j++)r[j*4+i]=a[i]*b[j*4]+a[4+i]*b[j*4+1]+a[8+i]*b[j*4+2]+a[12+i]*b[j*4+3];return r;}
+const ID=new Float32Array([1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]);
 
-  gl.useProgram(progGBuffer);
-  const uProbePos = uniformLoc(progGBuffer, 'uProbePos');
-  const uViewProj = uniformLoc(progGBuffer, 'uViewProj');
-  const uModel = uniformLoc(progGBuffer, 'uModel');
-  gl.uniform3fv(uProbePos, probePos);
+const cT=[[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]];
+const cU=[[0,-1,0],[0,-1,0],[0,0,1],[0,0,-1],[0,-1,0],[0,-1,0]];
 
-  gl.enable(gl.DEPTH_TEST);
-  gl.depthFunc(gl.LEQUAL);
-  // No face culling — we want to capture back faces of room interior
-  gl.disable(gl.CULL_FACE);
+// ═══════════════════════════════════════════════════════════════════════
+//  PRECOMPUTATION
+// ═══════════════════════════════════════════════════════════════════════
 
-  for (let face = 0; face < 6; face++) {
-    bindGBufferFace(gbuf.fbo, face, gbuf.radianceCM, gbuf.normalCM, gbuf.distanceCM);
+function renderProbeGB(pi) {
+  const pp = probePos[pi], gb = probeGB[pi], proj = persp(Math.PI/2, 1, 0.1, 20);
+  gl.useProgram(pProbe);
+  gl.uniform3fv(ul(pProbe, 'uQ'), pp);
+  gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL); gl.disable(gl.CULL_FACE);
+  const blk = new Float32Array([0, 0, 0, 1]);
+  const farDist = new Float32Array([20, 0, 0, 0]);
+  for (let f = 0; f < 6; f++) {
+    bindGBFace(gb.fbo, f, gb.rad, gb.nrm, gb.dist, gb.depthCM);
+    const vp = mul4(proj, lookAt(pp, [pp[0]+cT[f][0],pp[1]+cT[f][1],pp[2]+cT[f][2]], cU[f]));
+    gl.uniformMatrix4fv(ul(pProbe, 'uVP'), false, vp);
+    gl.viewport(0,0,RES,RES);
+    gl.clearBufferfv(gl.COLOR, 0, blk);
+    gl.clearBufferfv(gl.COLOR, 1, blk);
+    gl.clearBufferfv(gl.COLOR, 2, farDist);
+    gl.clear(gl.DEPTH_BUFFER_BIT);
+    for (const m of sceneVAOs) { gl.uniformMatrix4fv(ul(pProbe,'uM'),false,ID); gl.bindVertexArray(m.vao); gl.drawElements(gl.TRIANGLES,m.count,gl.UNSIGNED_SHORT,0); gl.bindVertexArray(null); }
+  }
+}
 
-    const view = lookAt(probePos, [
-      probePos[0] + CUBE_TARGETS[face][0],
-      probePos[1] + CUBE_TARGETS[face][1],
-      probePos[2] + CUBE_TARGETS[face][2],
-    ], CUBE_UPS[face]);
+function makeOctPass(pi, cm, arr, prog, uniformFns) {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, layerFBO);
+  gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, arr, 0, pi);
+  gl.drawBuffers([gl.COLOR_ATTACHMENT0]);
+  gl.viewport(0,0,OW,OH); gl.disable(gl.DEPTH_TEST);
+  gl.useProgram(prog);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_CUBE_MAP, cm);
+  gl.uniform1i(ul(prog, 'uRad'), 0);
+  if (prog === pOct) {
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_CUBE_MAP, probeGB[pi].nrm);
+    gl.uniform1i(ul(prog, 'uNrm'), 1);
+    gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_CUBE_MAP, probeGB[pi].dist);
+    gl.uniform1i(ul(prog, 'uDist'), 2);
+  }
+  if (prog === pIrr) gl.uniform1i(ul(prog, 'uN'), 1024);
+  if (uniformFns) uniformFns();
+  const st = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+  if (st !== gl.FRAMEBUFFER_COMPLETE) console.error('FBO inc:', st);
+  gl.bindVertexArray(qVAO); gl.drawArrays(gl.TRIANGLES,0,6); gl.bindVertexArray(null);
+}
 
-    const vp = mul(proj, view);
-    gl.uniformMatrix4fv(uViewProj, false, vp);
+function precompute() {
+  for (let i = 0; i < NUM_PROBES; i++) {
+    info.textContent = `Precomputing ${i+1}/${NUM_PROBES}...`;
+    renderProbeGB(i);
 
-    gl.viewport(0, 0, RES, RES);
-    gl.clearColor(0, 0, 0, 1);
-    gl.clearDepth(1);
-    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    // High-res octahedral distance → distHArr
+    makeOctPass(i, probeGB[i].dist, distHArr, pOct);
 
-    for (const mesh of sceneVAOs) {
-      gl.uniformMatrix4fv(uModel, false, IDENTITY);
-      gl.bindVertexArray(mesh.vao);
-      gl.drawElements(gl.TRIANGLES, mesh.count, gl.UNSIGNED_SHORT, 0);
+    // Low-res octahedral distance → distLArr
+    gl.bindFramebuffer(gl.FRAMEBUFFER, layerFBO);
+    gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, distLArr, 0, i);
+    gl.drawBuffers([gl.COLOR_ATTACHMENT0]);
+    gl.viewport(0,0,LW,LH); gl.disable(gl.DEPTH_TEST);
+    gl.useProgram(pOct);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_CUBE_MAP, probeGB[i].dist);
+    gl.uniform1i(ul(pOct,'uRad'),0);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_CUBE_MAP, probeGB[i].nrm);
+    gl.uniform1i(ul(pOct,'uNrm'),1);
+    gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_CUBE_MAP, probeGB[i].dist);
+    gl.uniform1i(ul(pOct,'uDist'),2);
+    gl.bindVertexArray(qVAO); gl.drawArrays(gl.TRIANGLES,0,6); gl.bindVertexArray(null);
+
+    // Irradiance filter → irrArr
+    makeOctPass(i, probeGB[i].rad, irrArr, pIrr);
+
+    // VSM filter → vsmArr
+    gl.bindFramebuffer(gl.FRAMEBUFFER, layerFBO);
+    gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, vsmArr, 0, i);
+    gl.drawBuffers([gl.COLOR_ATTACHMENT0]);
+    gl.viewport(0,0,OW,OH);
+    gl.useProgram(pVSM);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_CUBE_MAP, probeGB[i].dist);
+    gl.uniform1i(ul(pVSM,'uDist'),0);
+    gl.bindVertexArray(qVAO); gl.drawArrays(gl.TRIANGLES,0,6); gl.bindVertexArray(null);
+  }
+  info.textContent = `${NUM_PROBES} probes ready.`;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  RENDERING
+// ═══════════════════════════════════════════════════════════════════════
+
+// Scene G-buffer textures + depth (sized dynamically)
+let scenePosTex, sceneNrmTex, sceneAlbTex, sceneDepthRB, sceneFBO;
+
+function resizeSceneBufs(w, h) {
+  if (scenePosTex) {
+    gl.deleteTexture(scenePosTex); gl.deleteTexture(sceneNrmTex); gl.deleteTexture(sceneAlbTex);
+    gl.deleteRenderbuffer(sceneDepthRB); gl.deleteFramebuffer(sceneFBO);
+  }
+  scenePosTex = t2D(w, h);
+  sceneNrmTex = t2D(w, h);
+  sceneAlbTex = t2D(w, h);
+  sceneDepthRB = gl.createRenderbuffer();
+  gl.bindRenderbuffer(gl.RENDERBUFFER, sceneDepthRB);
+  gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, w, h);
+  sceneFBO = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, sceneFBO);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, scenePosTex, 0);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, sceneNrmTex, 0);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT2, gl.TEXTURE_2D, sceneAlbTex, 0);
+  gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, sceneDepthRB);
+  gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1, gl.COLOR_ATTACHMENT2]);
+  if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) console.error('Scene FBO inc');
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+}
+
+// ─── Camera controls (WASD + mouse look) ────────────────────────────
+let camPos = [0, 1, 8];
+let yaw = 0, pitch = 0;
+const keys = new Set();
+const camSpeed = 4;
+
+let debugMode = 0;      // 0=normal, 1=octUV, 2=distance, 3=steps, 4-6=texture views
+let singleProbe = -1;   // -1=all, 0..N-1=single probe only
+let lChord = false;     // tracks whether L was used in a digit chord
+const debugLabels = ['normal', 'oct UV', 'dist', 'steps', 'tex:irr', 'tex:dist', 'tex:split'];
+function updateInfo() {
+  const dbg = debugMode ? ` [debug:${debugLabels[debugMode]}]` : '';
+  const sp = singleProbe >= 0 ? ` [probe:${singleProbe}]` : '';
+  info.textContent = (document.pointerLockElement === canvas ? 'Click to release mouse' : `${NUM_PROBES} probes ready. Click for mouse look`) + dbg + sp;
+}
+
+canvas.addEventListener('click', () => canvas.requestPointerLock());
+document.addEventListener('pointerlockchange', updateInfo);
+document.addEventListener('mousemove', e => {
+  if (document.pointerLockElement !== canvas) return;
+  yaw += e.movementX * 0.002;
+  pitch = Math.max(-1.5, Math.min(1.5, pitch - e.movementY * 0.002));
+});
+document.addEventListener('keydown', e => {
+  keys.add(e.code);
+  if (e.code === 'KeyL' && !e.repeat) lChord = false;
+
+  const digit = parseInt(e.code.replace('Digit', ''));
+  const isDigit = !isNaN(digit) && digit >= 0 && digit <= 9;
+
+  if (isDigit && keys.has('KeyL')) {
+    // L+digit chord → texture view mode
+    lChord = true;
+    if (debugMode < 4 || debugMode > 6) debugMode = 4;
+    const probeMap = [6, 0, 1, 2, 3, 4, 5];
+    singleProbe = probeMap[digit] ?? 0;
+  } else if (isDigit) {
+    const tbl = [
+      { d:0, p:6 }, { d:1, p:-1 }, { d:2, p:-1 }, { d:3, p:-1 },
+      { d:0, p:0 }, { d:0, p:1 }, { d:0, p:2 }, { d:0, p:3 },
+      { d:0, p:4 }, { d:0, p:5 },
+    ];
+    debugMode = tbl[digit].d;
+    singleProbe = tbl[digit].p;
+  } else if (e.code === 'KeyR') {
+    debugMode = 0;
+    singleProbe = -1;
+  }
+  updateInfo();
+});
+document.addEventListener('keyup', e => {
+  if (e.code === 'KeyL' && !lChord) {
+    if (debugMode >= 4 && debugMode <= 6) {
+      debugMode = ((debugMode - 3) % 3) + 4;
+    } else {
+      debugMode = 4;
+      if (singleProbe < 0) singleProbe = 0;
     }
-    gl.bindVertexArray(null);
+    updateInfo();
   }
+  keys.delete(e.code);
+});
+
+function updateCamera(dt) {
+  const cx = Math.cos(yaw), sx = Math.sin(yaw);
+  const cy = Math.cos(pitch), sy = Math.sin(pitch);
+  const fwd = [cx * cy, sy, sx * cy];
+  const right = [-sx, 0, cx];
+  let speed = camSpeed * dt;
+  if (keys.has('ShiftLeft') || keys.has('ShiftRight')) speed *= 3;
+  if (keys.has('KeyW') || keys.has('ArrowUp'))    camPos = add(camPos, scale(fwd, speed));
+  if (keys.has('KeyS') || keys.has('ArrowDown'))  camPos = add(camPos, scale(fwd, -speed));
+  if (keys.has('KeyA') || keys.has('ArrowLeft'))  camPos = add(camPos, scale(right, -speed));
+  if (keys.has('KeyD') || keys.has('ArrowRight')) camPos = add(camPos, scale(right, speed));
+  if (keys.has('Space'))                          camPos[1] += speed;
+  if (keys.has('KeyZ'))                           camPos[1] -= speed;
 }
 
-// ─── Octahedral Mapping (cubemap → 2D) ──────────────────────────────
-function convertToOctahedral(probeIdx) {
-  const pd = probeData[probeIdx];
-  const { radianceCM, normalCM, distanceCM } = pd.gbuf;
-  const { fbo } = pd.oct;
+function add(a, b) { return [a[0]+b[0], a[1]+b[1], a[2]+b[2]]; }
+function scale(a, s) { return [a[0]*s, a[1]*s, a[2]*s]; }
 
-  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
-  gl.useProgram(progOctahedral);
-  gl.viewport(0, 0, OCT_RES * 2, OCT_RES);
-  gl.disable(gl.DEPTH_TEST);
+let lastTime = 0;
 
-  gl.activeTexture(gl.TEXTURE0);
-  gl.bindTexture(gl.TEXTURE_CUBE_MAP, radianceCM);
-  gl.uniform1i(uniformLoc(progOctahedral, 'uRadianceCubemap'), 0);
-  gl.activeTexture(gl.TEXTURE1);
-  gl.bindTexture(gl.TEXTURE_CUBE_MAP, normalCM);
-  gl.uniform1i(uniformLoc(progOctahedral, 'uNormalCubemap'), 1);
-  gl.activeTexture(gl.TEXTURE2);
-  gl.bindTexture(gl.TEXTURE_CUBE_MAP, distanceCM);
-  gl.uniform1i(uniformLoc(progOctahedral, 'uDistanceCubemap'), 2);
+function renderFrame(time) {
+  const dt = Math.min((time - lastTime) / 1000, 0.05);
+  lastTime = time;
+  updateCamera(dt);
 
-  gl.bindVertexArray(quadVAO);
-  gl.drawArrays(gl.TRIANGLES, 0, 6);
-  gl.bindVertexArray(null);
-}
-
-// ─── Irradiance Filter ───────────────────────────────────────────────
-function filterIrradiance(probeIdx) {
-  const pd = probeData[probeIdx];
-  const { radianceCM } = pd.gbuf;
-  const { fbo, tex } = pd.irr;
-
-  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
-  gl.useProgram(progIrradiance);
-  gl.viewport(0, 0, OCT_RES * 2, OCT_RES);
-  gl.activeTexture(gl.TEXTURE0);
-  gl.bindTexture(gl.TEXTURE_CUBE_MAP, radianceCM);
-  gl.uniform1i(uniformLoc(progIrradiance, 'uRadianceCubemap'), 0);
-  gl.uniform1i(uniformLoc(progIrradiance, 'uSampleCount'), 256);
-
-  gl.bindVertexArray(quadVAO);
-  gl.drawArrays(gl.TRIANGLES, 0, 6);
-  gl.bindVertexArray(null);
-}
-
-// ─── Variance Shadow Map Filter ──────────────────────────────────────
-function filterVSM(probeIdx) {
-  const pd = probeData[probeIdx];
-  const { distanceCM } = pd.gbuf;
-  const { fbo, tex } = pd.vsm;
-
-  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
-  gl.useProgram(progVSM);
-  gl.viewport(0, 0, OCT_RES * 2, OCT_RES);
-  gl.activeTexture(gl.TEXTURE0);
-  gl.bindTexture(gl.TEXTURE_CUBE_MAP, distanceCM);
-  gl.uniform1i(uniformLoc(progVSM, 'uDistanceCubemap'), 0);
-
-  gl.bindVertexArray(quadVAO);
-  gl.drawArrays(gl.TRIANGLES, 0, 6);
-  gl.bindVertexArray(null);
-}
-
-// ─── Precompute All Probes ───────────────────────────────────────────
-function precomputeAllProbes() {
-  for (let i = 0; i < probeData.length; i++) {
-    renderGBuffer(i);
-    convertToOctahedral(i);
-    filterIrradiance(i);
-    filterVSM(i);
-  }
-  info.textContent = `Precomputed ${probeData.length} probes. Ready.`;
-}
-
-// ─── Camera State for Debug View ────────────────────────────────────
-let camAngle = 0;
-
-// ─── Render Loop ─────────────────────────────────────────────────────
-function render() {
   const w = canvas.clientWidth * devicePixelRatio;
   const h = canvas.clientHeight * devicePixelRatio;
-  if (canvas.width !== w || canvas.height !== h) {
-    canvas.width = w; canvas.height = h;
-  }
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; resizeSceneBufs(w, h); }
 
+  const proj = persp(Math.PI/3, w/h, 0.1, 20);
+  const view = lookAt(camPos, add(camPos, [Math.cos(yaw)*Math.cos(pitch), Math.sin(pitch), Math.sin(yaw)*Math.cos(pitch)]), [0,1,0]);
+  const vp = mul4(proj, view);
+
+  // 1. Scene G-buffer
+  gl.bindFramebuffer(gl.FRAMEBUFFER, sceneFBO);
+  gl.viewport(0,0,w,h);
+  gl.clearColor(0,0,0,1); gl.clearDepth(1);
+  gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+  gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL); gl.disable(gl.CULL_FACE);
+  gl.useProgram(pScene);
+  gl.uniformMatrix4fv(ul(pScene,'uVP'), false, vp);
+  for (const m of sceneVAOs) { gl.uniformMatrix4fv(ul(pScene,'uM'),false,ID); gl.bindVertexArray(m.vao); gl.drawElements(gl.TRIANGLES,m.count,gl.UNSIGNED_SHORT,0); gl.bindVertexArray(null); }
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-  gl.viewport(0, 0, canvas.width, canvas.height);
-  gl.clearColor(0.08, 0.08, 0.08, 1);
-  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
-  // Debug: draw first probe's octahedral radiance map to screen
-  const pd = probeData[0];
-  if (pd && pd.oct.radiance2D) {
-    drawDebugTexture(pd.oct.radiance2D);
-  }
-
-  requestAnimationFrame(render);
-}
-
-// Minimal copy program for debug display
-const debugVS = `#version 300 es
-layout(location=0) in vec2 aPosition;
-out vec2 vUV;
-void main() {
-  vUV = aPosition * 0.5 + 0.5;
-  gl_Position = vec4(aPosition, 0.0, 1.0);
-}`;
-const debugFS = `#version 300 es
-precision highp float;
-uniform sampler2D uTex;
-in vec2 vUV;
-out vec4 fragColor;
-void main() {
-  fragColor = vec4(texture(uTex, vUV).rgb, 1.0);
-}`;
-const progDebug = createProgram(debugVS, debugFS);
-
-function drawDebugTexture(tex) {
-  if (!progDebug) return;
-  gl.useProgram(progDebug);
-  gl.activeTexture(gl.TEXTURE0);
-  gl.bindTexture(gl.TEXTURE_2D, tex);
-  gl.uniform1i(uniformLoc(progDebug, 'uTex'), 0);
+  // 2. Ray-march → screen (with tone mapping)
+  gl.viewport(0,0,w,h);
+  gl.clearColor(0.05,0.05,0.05,1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
   gl.disable(gl.DEPTH_TEST);
-  gl.bindVertexArray(quadVAO);
-  gl.drawArrays(gl.TRIANGLES, 0, 6);
-  gl.bindVertexArray(null);
+
+  gl.useProgram(pMarch);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, scenePosTex);
+  gl.uniform1i(ul(pMarch,'uPos'),0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, sceneNrmTex);
+  gl.uniform1i(ul(pMarch,'uNrm'),1);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, sceneAlbTex);
+  gl.uniform1i(ul(pMarch,'uAlb'),2);
+  gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D_ARRAY, irrArr);
+  gl.uniform1i(ul(pMarch,'uIrr'),3);
+  gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_2D_ARRAY, vsmArr);
+  gl.uniform1i(ul(pMarch,'uVSM'),4);
+  gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D_ARRAY, distHArr);
+  gl.uniform1i(ul(pMarch,'uDistH'),5);
+  gl.activeTexture(gl.TEXTURE6); gl.bindTexture(gl.TEXTURE_2D_ARRAY, distLArr);
+  gl.uniform1i(ul(pMarch,'uDistL'),6);
+
+  gl.uniform3fv(ul(pMarch,'uProbePos'), probePosFlat);
+  gl.uniform3fv(ul(pMarch,'uGMin'), GMIN);
+  gl.uniform3fv(ul(pMarch,'uGMax'), GMAX);
+  gl.uniform1i(ul(pMarch,'uDebug'), debugMode);
+  gl.uniform1i(ul(pMarch,'uSingleProbe'), singleProbe);
+
+  gl.bindVertexArray(qVAO); gl.drawArrays(gl.TRIANGLES, 0, 6); gl.bindVertexArray(null);
+
+  requestAnimationFrame(renderFrame);
 }
 
-// ─── Boot ────────────────────────────────────────────────────────────
-precomputeAllProbes();
-render();
+// ═══════════════════════════════════════════════════════════════════════
+//  BOOT
+// ═══════════════════════════════════════════════════════════════════════
+resizeSceneBufs(canvas.width, canvas.height);
+precompute();
+renderFrame(performance.now());
