@@ -1,0 +1,9 @@
+{
+  "name": "precomputed-light-field-probes",
+  "version": "1.0.0",
+  "private": true,
+  "description": "WebGL 2.0 implementation of Real-Time GI using Precomputed Light Field Probes",
+  "scripts": {
+    "serve": "python3 -m http.server 8000"
+  }
+}

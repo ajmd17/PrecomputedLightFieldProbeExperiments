@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Precomputed Light Field Probes - WebGL 2.0</title>
+<style>
+  body { margin: 0; overflow: hidden; background: #111; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #info {
+    position: absolute; top: 10px; left: 10px;
+    color: #0f0; font: 14px monospace; background: rgba(0,0,0,0.7); padding: 8px 12px;
+    border-radius: 4px; pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<div id="info">Initializing WebGL 2.0...</div>
+<canvas id="glcanvas"></canvas>
+<script type="importmap">
+{
+  "imports": {
+    "picogl": "https://cdn.jsdelivr.net/npm/picogl@0.5.2/dist/picogl.module.js"
+  }
+}
+</script>
+<script type="module" src="src/main.js"></script>
+</body>
+</html>
