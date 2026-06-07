@@ -4,8 +4,8 @@ import { VoxelGrid, sceneBounds, voxelizeScene } from './voxel.js';
 const RES = 128;
 const OCT_RES = 256;
 const LOW_RES = 64;
-const NUM_PROBES = 64; // total probes: 4x4x4
-const PROBE_DIM = 4; // probes per axis: 4x4x4
+const NX = 4, NY = 4, NZ = 4;
+const NUM_PROBES = NX * NY * NZ;
 
 const $ = document.getElementById.bind(document);
 const info = $('info');
@@ -237,13 +237,97 @@ const debugSphereVAO = (() => {
 
 // ─── Probe grid ──────────────────────────────────────────────────────
 const GMIN = [-4.0, -5.0, -3.5], GMAX = [4.0, 3.0, 2.0];
+const MAX_PROBES = 256;
 const probePos = Array.from({length:NUM_PROBES}, (_,i)=>{
-  const nx=PROBE_DIM, ny=PROBE_DIM, nz=PROBE_DIM;
-  const ix=i%nx, iy=Math.floor(i/nx)%ny, iz=Math.floor(i/(nx*ny));
-  const tx=ix/(nx-1), ty=iy/(ny-1), tz=iz/(nz-1);
+  const ix=i%NX, iy=Math.floor(i/NX)%NY, iz=Math.floor(i/(NX*NY));
+  const tx=ix/(NX-1), ty=iy/(NY-1), tz=iz/(NZ-1);
   return [GMIN[0]+tx*(GMAX[0]-GMIN[0]), GMIN[1]+ty*(GMAX[1]-GMIN[1]), GMIN[2]+tz*(GMAX[2]-GMIN[2])];
 });
-const probePosFlat = new Float32Array(probePos.flat());
+// ─── Probe offsets from voxel occupancy ────────────────────────────
+function rayDistToTri(ro, rd, v0, v1, v2) {
+  const e10 = v1[0]-v0[0], e11 = v1[1]-v0[1], e12 = v1[2]-v0[2];
+  const e20 = v2[0]-v0[0], e21 = v2[1]-v0[1], e22 = v2[2]-v0[2];
+  const pv0 = rd[1]*e22 - rd[2]*e21, pv1 = rd[2]*e20 - rd[0]*e22, pv2 = rd[0]*e21 - rd[1]*e20;
+  const det = e10*pv0 + e11*pv1 + e12*pv2;
+  if (Math.abs(det) < 1e-12) return null;
+  const inv = 1/det;
+  const tv0 = ro[0]-v0[0], tv1 = ro[1]-v0[1], tv2 = ro[2]-v0[2];
+  const u = (tv0*pv0 + tv1*pv1 + tv2*pv2) * inv;
+  if (u < 0 || u > 1) return null;
+  const qv0 = tv1*e12 - tv2*e11, qv1 = tv2*e10 - tv0*e12, qv2 = tv0*e11 - tv1*e10;
+  const v = (rd[0]*qv0 + rd[1]*qv1 + rd[2]*qv2) * inv;
+  if (v < 0 || u+v > 1) return null;
+  const t = (e20*qv0 + e21*qv1 + e22*qv2) * inv;
+  return t > 1e-8 ? t : null;
+}
+function insideMesh(px, py, pz, meshes) {
+  const ro = [px, py, pz];
+  const dirs = [[1,0,0],[0,1,0],[0,0,1]];
+  for (const rd of dirs) {
+    let hits = 0;
+    for (const mesh of meshes) {
+      const pos = mesh.pos, idx = mesh.idx;
+      for (let ti = 0; ti < idx.length; ti += 3) {
+        const v0 = [pos[idx[ti]*3], pos[idx[ti]*3+1], pos[idx[ti]*3+2]];
+        const v1 = [pos[idx[ti+1]*3], pos[idx[ti+1]*3+1], pos[idx[ti+1]*3+2]];
+        const v2 = [pos[idx[ti+2]*3], pos[idx[ti+2]*3+1], pos[idx[ti+2]*3+2]];
+        if (rayDistToTri(ro, rd, v0, v1, v2) !== null) hits++;
+      }
+    }
+    if (hits % 2 === 1) return true;
+  }
+  return false;
+}
+function findNearestExit(px, py, pz, meshes) {
+  const ro = [px, py, pz];
+  const dirs = [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]];
+  let bestT = Infinity, bestD = null;
+  for (const rd of dirs) {
+    for (const mesh of meshes) {
+      const pos = mesh.pos, idx = mesh.idx;
+      for (let ti = 0; ti < idx.length; ti += 3) {
+        const v0 = [pos[idx[ti]*3], pos[idx[ti]*3+1], pos[idx[ti]*3+2]];
+        const v1 = [pos[idx[ti+1]*3], pos[idx[ti+1]*3+1], pos[idx[ti+1]*3+2]];
+        const v2 = [pos[idx[ti+2]*3], pos[idx[ti+2]*3+1], pos[idx[ti+2]*3+2]];
+        const t = rayDistToTri(ro, rd, v0, v1, v2);
+        if (t !== null && t < bestT) { bestT = t; bestD = rd; }
+      }
+    }
+  }
+  return bestD === null ? null : [bestD[0]*(bestT+0.05), bestD[1]*(bestT+0.05), bestD[2]*(bestT+0.05)];
+}
+const probeOffsets = [], probeActive = new Float32Array(MAX_PROBES);
+let pushed = 0, inactive = 0;
+for (let i = 0; i < NX * NY * NZ; i++) {
+  const ix = i % NX, iy = Math.floor(i / NX) % NY, iz = Math.floor(i / (NX * NY));
+  const wx = GMIN[0] + (ix/(NX-1))*(GMAX[0]-GMIN[0]);
+  const wy = GMIN[1] + (iy/(NY-1))*(GMAX[1]-GMIN[1]);
+  const wz = GMIN[2] + (iz/(NZ-1))*(GMAX[2]-GMIN[2]);
+  if (insideMesh(wx, wy, wz, M)) {
+    const off = findNearestExit(wx, wy, wz, M);
+    if (off) {
+      probeOffsets.push(off);
+      probeActive[i] = 1.0;
+      pushed++;
+    } else {
+      probeOffsets.push([0, 0, 0]);
+      probeActive[i] = 0.0;
+      inactive++;
+    }
+  } else {
+    probeOffsets.push([0, 0, 0]);
+    probeActive[i] = 1.0;
+  }
+}
+const adjProbePos = probePos.map((p, i) => [p[0] + probeOffsets[i][0], p[1] + probeOffsets[i][1], p[2] + probeOffsets[i][2]]);
+console.log(`Probe offsets: ${pushed} pushed, ${inactive} inactive, ${NUM_PROBES-pushed-inactive} untouched`);
+
+const probePosFlat = new Float32Array(MAX_PROBES * 3);
+for (let i = 0; i < NUM_PROBES; i++) {
+  probePosFlat[i*3] = adjProbePos[i][0];
+  probePosFlat[i*3+1] = adjProbePos[i][1];
+  probePosFlat[i*3+2] = adjProbePos[i][2];
+}
 
 // ─── Probe G-buffer cubemap allocation ────────────────────────────────
 function allocProbeGB() {
@@ -335,7 +419,7 @@ function makeOctPass(layer, cm, arr, prog, nrmCM, distCM) {
     gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_CUBE_MAP, distCM);
     gl.uniform1i(ul(prog, 'uDist'), 2);
   }
-  if (prog === pIrr) gl.uniform1i(ul(prog, 'uN'), 1024);
+  if (prog === pIrr) { gl.uniform1i(ul(prog, 'uN'), 1024); gl.uniform1f(ul(prog, 'uWrap'), 0.3); }
   const st = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
   if (st !== gl.FRAMEBUFFER_COMPLETE) console.error('FBO inc:', st);
   gl.bindVertexArray(qVAO); gl.drawArrays(gl.TRIANGLES,0,6); gl.bindVertexArray(null);
@@ -345,7 +429,7 @@ function precompute() {
   for (let i = 0; i < NUM_PROBES; i++) {
     info.textContent = `Precomputing ${i+1}/${NUM_PROBES}...`;
     const gb = allocProbeGB();
-    renderProbeGB(gb, probePos[i]);
+    renderProbeGB(gb, adjProbePos[i]);
 
     // High-res octahedral distance → distHArr
     makeOctPass(i, gb.dist, distHArr, pOct, gb.nrm, gb.dist);
@@ -367,12 +451,14 @@ function precompute() {
     // Irradiance filter → irrArr
     makeOctPass(i, gb.rad, irrArr, pIrr, null, null);
 
-    // VSM filter → vsmArr
+    // VSM filter → vsmArr (cosine-power pre-filter)
     gl.bindFramebuffer(gl.FRAMEBUFFER, layerFBO);
     gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, vsmArr, 0, i);
     gl.drawBuffers([gl.COLOR_ATTACHMENT0]);
     gl.viewport(0,0,OW,OH);
     gl.useProgram(pVSM);
+    gl.uniform1f(ul(pVSM,'uCosinePower'), 50.0);
+    gl.uniform1i(ul(pVSM,'uSampleCount'), 64);
     gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_CUBE_MAP, gb.dist);
     gl.uniform1i(ul(pVSM,'uDist'),0);
     gl.bindVertexArray(qVAO); gl.drawArrays(gl.TRIANGLES,0,6); gl.bindVertexArray(null);
@@ -491,7 +577,7 @@ function renderFrame(time) {
   gl.uniformMatrix4fv(ul(pScene,'uVP'), false, vp);
   for (const m of sceneVAOs) { gl.uniformMatrix4fv(ul(pScene,'uM'),false,ID); gl.bindVertexArray(m.vao); gl.drawElements(gl.TRIANGLES,m.count,gl.UNSIGNED_SHORT,0); gl.bindVertexArray(null); }
   if (singleProbe >= 0) {
-    const pp = probePos[singleProbe];
+    const pp = adjProbePos[singleProbe];
     const M = new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, pp[0],pp[1],pp[2],1]);
     gl.uniformMatrix4fv(ul(pScene,'uM'), false, M);
     gl.bindVertexArray(debugSphereVAO.vao);
@@ -499,7 +585,7 @@ function renderFrame(time) {
     gl.bindVertexArray(null);
   } else {
     for (let pi = 0; pi < NUM_PROBES; pi++) {
-      const pp = probePos[pi];
+      const pp = adjProbePos[pi];
       const M = new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, pp[0],pp[1],pp[2],1]);
       gl.uniformMatrix4fv(ul(pScene,'uM'), false, M);
       gl.bindVertexArray(debugSphereVAO.vao);
@@ -532,8 +618,10 @@ function renderFrame(time) {
   gl.uniform1i(ul(pMarch,'uDistL'),6);
 
   gl.uniform3fv(ul(pMarch,'uProbePos'), probePosFlat);
+  gl.uniform1fv(ul(pMarch,'uProbeActive'), probeActive);
   gl.uniform3fv(ul(pMarch,'uGMin'), GMIN);
   gl.uniform3fv(ul(pMarch,'uGMax'), GMAX);
+  gl.uniform3i(ul(pMarch,'uGridDim'), NX, NY, NZ);
   {
     const cy = Math.cos(yaw), sy = Math.sin(yaw);
     const cp = Math.cos(pitch), sp = Math.sin(pitch);

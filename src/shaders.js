@@ -98,12 +98,13 @@ void main() {
 }
 `;
 
-// ─── Irradiance filter (Lambertian convolution) ─────────────────────
+// ─── Irradiance filter (DDGI wrap + Lambertian convolution) ─────────
 export const irrFrag = `#version 300 es
 precision highp float;
 #define PI 3.14159265
 uniform highp samplerCube uRad;
 uniform int uN;
+uniform float uWrap;
 in vec2 vUV;
 layout(location=0) out vec4 oI;
 ${octHelpers}
@@ -115,42 +116,55 @@ void main() {
   vec3 N = octDecode(vUV);
   mat3 B = buildBasis(N);
   vec3 irr = vec3(0); int Ns = uN;
-  for (int i = 0; i < 1024; i++) {
+  for (int i = 0; i < 2048; i++) {
     if (i >= Ns) break;
     vec3 L = fibSph(i, Ns);
-    if (L.z <= 0.0) continue;
-    irr += texture(uRad, B * L).rgb * L.z;
+    float w = max(0.0, (L.z + uWrap) / (1.0 + uWrap));
+    if (w <= 0.0) continue;
+    irr += texture(uRad, B * L).rgb * w;
   }
   oI = vec4(irr * 4.0 * PI / float(Ns), 1);
 }
 `;
 
-// ─── VSM filter (disk-sampled cone) ─────────────────────────────────
+// ─── VSM filter (cosine-power pre-filter) ───────────────────────────
 export const vsmFrag = `#version 300 es
 precision highp float;
 uniform highp samplerCube uDist;
+uniform float uCosinePower;
+uniform int uSampleCount;
 in vec2 vUV;
 layout(location=0) out vec4 oV;
 ${octHelpers}
 void main() {
   vec3 d = octDecode(vUV);
   float dd = texture(uDist, d).r;
-  float avg = dd, avgSq = dd*dd;
 
   vec3 up = abs(d.y) < 0.999 ? vec3(0,1,0) : vec3(1,0,0);
   vec3 T = normalize(cross(up, d));
   vec3 B = cross(d, T);
 
-  float coneR = 0.04;
-  for (int i = 0; i < 16; i++) {
-    float r = sqrt(float(i+1) / 16.0) * coneR;
+  float tw = 1.0;
+  float avg = dd, avgSq = dd*dd;
+
+  float coneR = 0.9;
+  int Ns = uSampleCount;
+  for (int i = 0; i < 2048; i++) {
+    if (i >= Ns) break;
+    float r = sqrt(float(i+1) / float(Ns)) * coneR;
     float phi = 2.399963 * float(i);
     vec3 s = normalize(d + (T * cos(phi) + B * sin(phi)) * r);
+    float w = pow(max(0.0, dot(d, s)), uCosinePower);
     float x = texture(uDist, s).r;
-    avg += x; avgSq += x*x;
+    avg += x * w;
+    avgSq += x*x * w;
+    tw += w;
   }
-  float iN = 1.0/17.0; avg *= iN; avgSq *= iN;
-  oV = vec4(avg, max(abs(avgSq - avg*avg), 1e-6), 0.0, 1.0);
+
+  avg /= tw;
+  avgSq /= tw;
+  float variance = max(abs(avgSq - avg*avg), 1e-6);
+  oV = vec4(avg, variance, 0.0, 1.0);
 }
 `;
 
@@ -158,8 +172,7 @@ void main() {
 export const raymarchFrag = `#version 300 es
 precision highp float;
 
-#define NPROBES_PER_AXIS 4
-#define NPROBES (NPROBES_PER_AXIS * NPROBES_PER_AXIS * NPROBES_PER_AXIS)
+#define MAX_PROBES 256
 
 uniform highp sampler2D uPos;
 uniform highp sampler2D uNrm;
@@ -169,9 +182,11 @@ uniform highp sampler2DArray uVSM;
 uniform highp sampler2DArray uDistH;
 uniform highp sampler2DArray uDistL;
 
-uniform vec3 uProbePos[NPROBES];
+uniform vec3 uProbePos[MAX_PROBES];
+uniform float uProbeActive[MAX_PROBES];
 uniform vec3 uGMin;
 uniform vec3 uGMax;
+uniform ivec3 uGridDim;
 uniform vec3 uCamFwd;
 uniform vec3 uCamUp;
 uniform vec3 uCamRight;
@@ -187,17 +202,16 @@ out vec4 fColor;
 
 ${octHelpers}
 
-// Find 4x4x4 grid cell containing P, return 8 corner indices & weights
 void getProbeSlice(vec3 P, out int idx[8], out float wt[8]) {
   vec3 t = clamp((P - uGMin) / (uGMax - uGMin), 0.0, 1.0);
-  float step = 1.0 / float(NPROBES_PER_AXIS - 1);
+  vec3 step = 1.0 / (vec3(uGridDim) - 1.0);
   ivec3 cell = ivec3(floor(t / step));
-  cell = min(cell, ivec3(NPROBES_PER_AXIS - 2));
+  cell = min(cell, uGridDim - 2);
   vec3 f = (t - vec3(cell) * step) / step;
   float x=f.x, y=f.y, z=f.z;
   float ox=1.0-x, oy=1.0-y, oz=1.0-z;
   int ci=cell.x, cj=cell.y, ck=cell.z;
-  int s1=1, s2=NPROBES_PER_AXIS, s3=NPROBES_PER_AXIS*NPROBES_PER_AXIS;
+  int s1=1, s2=uGridDim.x, s3=uGridDim.x * uGridDim.y;
   int base = ci + cj*s2 + ck*s3;
   idx[0]=base;                 wt[0]=ox*oy*oz;
   idx[1]=base+s1;              wt[1]=x *oy*oz;
@@ -246,7 +260,7 @@ float probeVis(vec3 P, vec3 Q, int pi, out int steps) {
       }
     } else {
       sd = texture(uDistL, vec3(uv, pi)).r;
-      if (t - sd + uDistBias > -0.15) { hires = true; marchStep = 0.05; continue; }
+      if (t - sd + uDistBias > -0.015) { hires = true; marchStep = 0.05; continue; }
     }
     t += marchStep;
   }
@@ -330,7 +344,7 @@ void main() {
   float twTri = 0.0;
   float dbgBF = 0.0, dbgVis = 0.0;
 
-  if (uSingleProbe >= 0 && uSingleProbe < NPROBES) {
+  if (uSingleProbe >= 0 && uSingleProbe < uGridDim.x * uGridDim.y * uGridDim.z && uProbeActive[uSingleProbe] >= 0.5) {
     int i = uSingleProbe;
     vec3 Q = uProbePos[i];
     vec3 dQ = normalize(Q - P);
@@ -352,6 +366,7 @@ void main() {
       float weight = pw[j];
       if (weight < 0.001) continue;
       int i = pi[j];
+      if (uProbeActive[i] < 0.5) continue;
       vec3 Q = uProbePos[i];
       float radial = smoothstep(0.0, 0.4, length(P - Q));
       vec3 dQ = normalize(Q - P);
