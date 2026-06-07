@@ -3,7 +3,8 @@ import * as S from './shaders.js';
 const RES = 256;
 const OCT_RES = 256;
 const LOW_RES = 64;
-const NUM_PROBES = 8;
+const NUM_PROBES = 64;
+const PROBE_DIM = 4; // probes per axis: 4×4×4
 
 const $ = document.getElementById.bind(document);
 const info = $('info');
@@ -91,15 +92,97 @@ function box(cx,cy,cz, sx,sy,sz, r,g,b) {
   const idx = []; for (let f=0;f<6;f++) { const b=f*4; idx.push(b,b+1,b+2,b,b+2,b+3); }
   return {pos:p, nrm:n, col:[r,g,b], idx};
 }
+function sphere(cx,cy,cz, r, slats, staves, rcol,gcol,bcol) {
+  const p = [], n = [];
+  for (let j = 0; j <= slats; j++) {
+    const theta = j * Math.PI / slats;
+    for (let i = 0; i <= staves; i++) {
+      const phi = i * 2 * Math.PI / staves;
+      const x = r * Math.sin(theta) * Math.cos(phi);
+      const y = r * Math.cos(theta);
+      const z = r * Math.sin(theta) * Math.sin(phi);
+      p.push(cx+x, cy+y, cz+z); n.push(x/r, y/r, z/r);
+    }
+  }
+  const idx = [];
+  for (let j = 0; j < slats; j++) {
+    for (let i = 0; i < staves; i++) {
+      const a = j*(staves+1)+i, b = a+staves+1;
+      idx.push(a, b, a+1, a+1, b, b+1);
+    }
+  }
+  return {pos:p, nrm:n, col:[rcol,gcol,bcol], idx};
+}
+function cone(cx,cy,cz, rad, height, segs, rcol,gcol,bcol) {
+  const p = [], n = [];
+  const tip = [cx, cy+height/2, cz], baseC = [cx, cy-height/2, cz];
+  // side vertices
+  for (let i = 0; i <= segs; i++) {
+    const a = i / segs * 2 * Math.PI;
+    const x = rad * Math.cos(a), z = rad * Math.sin(a);
+    p.push(baseC[0]+x, baseC[1], baseC[2]+z);
+    // side normal: normalize(cross(tangent_u, tangent_v))
+    const dx = x, dz = z, dl = Math.sqrt(dx*dx + dz*dz);
+    const nx = dx/dl * height/2, ny = rad, nz = dz/dl * height/2;
+    const nl = Math.sqrt(nx*nx + ny*ny + nz*nz);
+    n.push(nx/nl, ny/nl, nz/nl);
+  }
+  // tip vertex
+  p.push(tip[0], tip[1], tip[2]);
+  n.push(0, 1, 0);
+  // base center
+  p.push(baseC[0], baseC[1], baseC[2]);
+  n.push(0, -1, 0);
+  const tipIdx = p.length/3-2, baseIdx = p.length/3-1;
+  const idx = [];
+  for (let i = 0; i < segs; i++) {
+    idx.push(i, (i+1)%segs, tipIdx);
+  }
+  // base cap (triangle fan)
+  for (let i = 1; i < segs-1; i++) {
+    idx.push(baseIdx, i, i+1);
+  }
+  return {pos:p, nrm:n, col:[rcol,gcol,bcol], idx};
+}
+function torus(cx,cy,cz, R, r, us, vs, rcol,gcol,bcol) {
+  const p = [], n = [];
+  for (let j = 0; j <= vs; j++) {
+    const v = j / vs * 2 * Math.PI;
+    for (let i = 0; i <= us; i++) {
+      const u = i / us * 2 * Math.PI;
+      const x = (R + r*Math.cos(v)) * Math.cos(u);
+      const y = r * Math.sin(v);
+      const z = (R + r*Math.cos(v)) * Math.sin(u);
+      p.push(cx+x, cy+y, cz+z);
+      n.push(Math.cos(v)*Math.cos(u), Math.sin(v), Math.cos(v)*Math.sin(u));
+    }
+  }
+  const idx = [];
+  for (let j = 0; j < vs; j++) {
+    for (let i = 0; i < us; i++) {
+      const a = j*(us+1)+i, b = a+us+1;
+      idx.push(a, b, a+1, a+1, b, b+1);
+    }
+  }
+  return {pos:p, nrm:n, col:[rcol,gcol,bcol], idx};
+}
+
 const M = [
+  // Room
   box(0,-4,0, 10,0.5,10, 0.9,0.9,0.9),
   box(-5,0,0, 0.5,8,10, 1.0,0.2,0.2),
   box(5,0,0, 0.5,8,10, 0.2,0.2,1.0),
   box(0,0,-5, 10,8,0.5, 0.8,0.8,0.8),
   box(0,4,0, 10,0.5,10, 0.6,0.6,0.6),
+  // Existing objects
   box(-2,-3,0, 2,2,2, 0.1,0.9,0.1),
   box(2.5,-2.5,-2, 1.5,3,1.5, 1.0,0.6,0.1),
+  // Ceiling light
   box(0,3.5,0, 4,0.2,4, 5.0,5.0,5.0),
+  // New shapes
+  sphere(-1, -0.5, 1.5, 0.8, 24, 16, 0.7, 0.2, 0.2),
+  cone(1, 0, 1.5, 0.7, 1.4, 24, 0.2, 0.6, 0.4),
+  torus(0, 0, -1.5, 1.0, 0.35, 24, 16, 0.9, 0.7, 0.1),
 ];
 const sceneVAOs = (() => {
   const r = [];
@@ -121,10 +204,32 @@ const sceneVAOs = (() => {
   return r;
 })();
 
+// Debug probe sphere VAO (rendered into G-buffer for spatial visualization)
+const debugSphereMesh = sphere(0,0,0, 0.12, 12, 8, 5, 5, 5);
+// Negate normals so the probe center passes the backface test (inward-facing normals)
+for (let i = 0; i < debugSphereMesh.nrm.length; i++) debugSphereMesh.nrm[i] = -debugSphereMesh.nrm[i];
+const debugSphereVAO = (() => {
+  const m = debugSphereMesh;
+  const vc = m.pos.length/3;
+  const pb=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,pb); gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(m.pos),gl.STATIC_DRAW);
+  const nb=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,nb); gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(m.nrm),gl.STATIC_DRAW);
+  const cd=new Float32Array(vc*3); for(let i=0;i<vc;i++){cd[i*3]=m.col[0];cd[i*3+1]=m.col[1];cd[i*3+2]=m.col[2];}
+  const cb=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,cb); gl.bufferData(gl.ARRAY_BUFFER,cd,gl.STATIC_DRAW);
+  const ib=gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,ib); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,new Uint16Array(m.idx),gl.STATIC_DRAW);
+  const vao=gl.createVertexArray(); gl.bindVertexArray(vao);
+  gl.bindBuffer(gl.ARRAY_BUFFER,pb); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0,3,gl.FLOAT,false,0,0);
+  gl.bindBuffer(gl.ARRAY_BUFFER,nb); gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1,3,gl.FLOAT,false,0,0);
+  gl.bindBuffer(gl.ARRAY_BUFFER,cb); gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2,3,gl.FLOAT,false,0,0);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,ib);
+  gl.bindVertexArray(null);
+  return {vao, count:m.idx.length};
+})();
+
 // ─── Probe grid ──────────────────────────────────────────────────────
 const GMIN = [-4.0, -5.0, -3.5], GMAX = [4.0, 3.0, 2.0];
 const probePos = Array.from({length:NUM_PROBES}, (_,i)=>{
-  const nx=2,ny=2,nz=2, ix=i%nx, iy=Math.floor(i/nx)%ny, iz=Math.floor(i/(nx*ny));
+  const nx=PROBE_DIM, ny=PROBE_DIM, nz=PROBE_DIM;
+  const ix=i%nx, iy=Math.floor(i/nx)%ny, iz=Math.floor(i/(nx*ny));
   const tx=ix/(nx-1), ty=iy/(ny-1), tz=iz/(nz-1);
   return [GMIN[0]+tx*(GMAX[0]-GMIN[0]), GMIN[1]+ty*(GMAX[1]-GMIN[1]), GMIN[2]+tz*(GMAX[2]-GMIN[2])];
 });
@@ -157,10 +262,10 @@ function bindGBFace(fbo, face, r, n, d, depth) {
 // ─── Texture arrays ──────────────────────────────────────────────────
 const OW = OCT_RES*2, OH = OCT_RES;
 const LW = LOW_RES*2, LH = LOW_RES;
-const irrArr = t2DA(OW, OH, NUM_PROBES);
+const irrArr = t2DA(OW, OH, NUM_PROBES, 4, gl.NEAREST);
 const vsmArr = t2DA(OW, OH, NUM_PROBES, 2, gl.LINEAR);
-const distHArr = t2DA(OW, OH, NUM_PROBES, 1, gl.NEAREST);
-const distLArr = t2DA(LW, LH, NUM_PROBES, 1, gl.NEAREST);
+const distHArr = t2DA(OW, OH, NUM_PROBES, 1, gl.LINEAR);
+const distLArr = t2DA(LW, LH, NUM_PROBES, 1, gl.LINEAR);
 
 const layerFBO = gl.createFramebuffer();
 
@@ -295,10 +400,10 @@ let yaw = 0, pitch = 0;
 const keys = new Set();
 const camSpeed = 4;
 
-let debugMode = 0;      // 0=normal, 1=octUV, 2=distance, 3=steps, 4-6=texture views
+let debugMode = 0;      // 0=normal, 1=octUV, 2=distance, 3=steps, 4-6=texture views, 7=trilinear-only, 8=tw, 9=backface, 10=vis
 let singleProbe = -1;   // -1=all, 0..N-1=single probe only
-let lChord = false;     // tracks whether L was used in a digit chord
-const debugLabels = ['normal', 'oct UV', 'dist', 'steps', 'tex:irr', 'tex:dist', 'tex:split'];
+let lChord = false;
+const debugLabels = ['normal', 'oct UV', 'dist', 'steps', 'tex:irr', 'tex:dist', 'tex:split', 'trilinear', 'weight', 'backface', 'visibility'];
 function updateInfo() {
   const dbg = debugMode ? ` [debug:${debugLabels[debugMode]}]` : '';
   const sp = singleProbe >= 0 ? ` [probe:${singleProbe}]` : '';
@@ -394,6 +499,23 @@ function renderFrame(time) {
   gl.useProgram(pScene);
   gl.uniformMatrix4fv(ul(pScene,'uVP'), false, vp);
   for (const m of sceneVAOs) { gl.uniformMatrix4fv(ul(pScene,'uM'),false,ID); gl.bindVertexArray(m.vao); gl.drawElements(gl.TRIANGLES,m.count,gl.UNSIGNED_SHORT,0); gl.bindVertexArray(null); }
+  if (singleProbe >= 0) {
+    const pp = probePos[singleProbe];
+    const M = new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, pp[0],pp[1],pp[2],1]);
+    gl.uniformMatrix4fv(ul(pScene,'uM'), false, M);
+    gl.bindVertexArray(debugSphereVAO.vao);
+    gl.drawElements(gl.TRIANGLES, debugSphereVAO.count, gl.UNSIGNED_SHORT, 0);
+    gl.bindVertexArray(null);
+  } else {
+    for (let pi = 0; pi < NUM_PROBES; pi++) {
+      const pp = probePos[pi];
+      const M = new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, pp[0],pp[1],pp[2],1]);
+      gl.uniformMatrix4fv(ul(pScene,'uM'), false, M);
+      gl.bindVertexArray(debugSphereVAO.vao);
+      gl.drawElements(gl.TRIANGLES, debugSphereVAO.count, gl.UNSIGNED_SHORT, 0);
+      gl.bindVertexArray(null);
+    }
+  }
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
   // 2. Ray-march → screen (with tone mapping)
@@ -421,6 +543,20 @@ function renderFrame(time) {
   gl.uniform3fv(ul(pMarch,'uProbePos'), probePosFlat);
   gl.uniform3fv(ul(pMarch,'uGMin'), GMIN);
   gl.uniform3fv(ul(pMarch,'uGMax'), GMAX);
+  {
+    const cy = Math.cos(yaw), sy = Math.sin(yaw);
+    const cp = Math.cos(pitch), sp = Math.sin(pitch);
+    const fwd = [cy*cp, sp, sy*cp], up = [-cy*sp, cp, -sy*sp], right = [-sy, 0, cy];
+    gl.uniform3fv(ul(pMarch, 'uCamFwd'), fwd);
+    gl.uniform3fv(ul(pMarch, 'uCamUp'), up);
+    gl.uniform3fv(ul(pMarch, 'uCamRight'), right);
+  }
+  gl.uniform1f(ul(pMarch, 'uTanHalfFov'), Math.tan(Math.PI/6));
+  gl.uniform1f(ul(pMarch, 'uAspect'), w/h);
+  gl.uniform1f(ul(pMarch, 'uNormalBias'), 0.03);
+  gl.uniform1f(ul(pMarch, 'uDistBias'), 0.02);
+  gl.uniform3fv(ul(pMarch, 'uLightPos'), [0, 3.5, 0]);
+  gl.uniform3fv(ul(pMarch, 'uLightCol'), [20, 20, 20]);
   gl.uniform1i(ul(pMarch,'uDebug'), debugMode);
   gl.uniform1i(ul(pMarch,'uSingleProbe'), singleProbe);
 

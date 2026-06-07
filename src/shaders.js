@@ -137,7 +137,7 @@ void main() {
     avg += x; avgSq += x*x;
   }
   float iN = 1.0/17.0; avg *= iN; avgSq *= iN;
-  oV = vec4(avg, max(avgSq - avg*avg, 0.0), 0.0, 1.0);
+  oV = vec4(avg, max(abs(avgSq - avg*avg), 1e-6), 0.0, 1.0);
 }
 `;
 
@@ -145,7 +145,8 @@ void main() {
 export const raymarchFrag = `#version 300 es
 precision highp float;
 
-#define NPROBES 8
+#define NPROBES_PER_AXIS 4
+#define NPROBES (NPROBES_PER_AXIS * NPROBES_PER_AXIS * NPROBES_PER_AXIS)
 
 uniform highp sampler2D uPos;
 uniform highp sampler2D uNrm;
@@ -158,6 +159,15 @@ uniform highp sampler2DArray uDistL;
 uniform vec3 uProbePos[NPROBES];
 uniform vec3 uGMin;
 uniform vec3 uGMax;
+uniform vec3 uCamFwd;
+uniform vec3 uCamUp;
+uniform vec3 uCamRight;
+uniform float uTanHalfFov;
+uniform float uAspect;
+uniform float uNormalBias;
+uniform float uDistBias;
+uniform vec3 uLightPos;
+uniform vec3 uLightCol;
 uniform int uDebug;
 uniform int uSingleProbe;
 
@@ -166,57 +176,75 @@ out vec4 fColor;
 
 ${octHelpers}
 
-// Trilinear weights for 2x2x2 probe grid
-void triW(vec3 p, vec3 mn, vec3 mx, out float w[8]) {
-  vec3 t = clamp((p - mn) / (mx - mn), 0.0, 1.0);
-  float x=t.x, y=t.y, z=t.z, ox=1.0-x, oy=1.0-y, oz=1.0-z;
-  w[0]=ox*oy*oz; w[1]=x*oy*oz; w[2]=ox*y*oz; w[3]=x*y*oz;
-  w[4]=ox*oy*z;  w[5]=x*oy*z;  w[6]=ox*y*z;  w[7]=x*y*z;
+// Find 4x4x4 grid cell containing P, return 8 corner indices & weights
+void getProbeSlice(vec3 P, out int idx[8], out float wt[8]) {
+  vec3 t = clamp((P - uGMin) / (uGMax - uGMin), 0.0, 1.0);
+  float step = 1.0 / float(NPROBES_PER_AXIS - 1);
+  ivec3 cell = ivec3(floor(t / step));
+  cell = min(cell, ivec3(NPROBES_PER_AXIS - 2));
+  vec3 f = (t - vec3(cell) * step) / step;
+  float x=f.x, y=f.y, z=f.z;
+  float ox=1.0-x, oy=1.0-y, oz=1.0-z;
+  int ci=cell.x, cj=cell.y, ck=cell.z;
+  int s1=1, s2=NPROBES_PER_AXIS, s3=NPROBES_PER_AXIS*NPROBES_PER_AXIS;
+  int base = ci + cj*s2 + ck*s3;
+  idx[0]=base;                 wt[0]=ox*oy*oz;
+  idx[1]=base+s1;              wt[1]=x *oy*oz;
+  idx[2]=base+s2;              wt[2]=ox*y *oz;
+  idx[3]=base+s1+s2;           wt[3]=x *y *oz;
+  idx[4]=base+s3;              wt[4]=ox*oy*z;
+  idx[5]=base+s1+s3;           wt[5]=x *oy*z;
+  idx[6]=base+s2+s3;           wt[6]=ox*y *z;
+  idx[7]=base+s1+s2+s3;        wt[7]=x *y *z;
 }
 
 // Chebyshev upper-bound visibility
 float cheb(float d, float avg, float var) {
   if (d <= avg) return 1.0;
   float dd = d - avg;
-  return clamp(var / max(var + dd*dd, 1e-6), 0.0, 1.0);
+  float p = var / (var + dd*dd);
+  float bias = 0.05;
+  return clamp((p - bias) / max(1.0 - bias, 1e-6), 0.0, 1.0);
 }
 
 // Probe visibility with step counter
 float probeVis(vec3 P, vec3 Q, int pi, out int steps) {
   vec3 rdir = normalize(P - Q);
-  float dist = length(P - Q);
+  float dist = max(length(P - Q) - uDistBias, 0.001);
   vec2 uv = octEncode(rdir);
 
-  // VSM visibility (single lookup)
+  // VSM Chebyshev visibility
   vec2 vsm = texture(uVSM, vec3(uv, pi)).rg;
-  float vis0 = cheb(dist, vsm.x, vsm.y);
+  float vis = cheb(dist, vsm.x, vsm.y);
   steps = 1;
-  if (vis0 < 0.01) return 0.0;
-  if (vis0 > 0.95) return vis0;
+  if (vis < 0.001) return 0.0;
+  if (vis > 0.95) return vis;
 
-  // Refinement: march along ray with resolution swap
+  // Refinement: ray-march with resolution swap
   float t = 0.0;
-  float step = 0.5;
+  float marchStep = 0.5;
   bool hires = false;
   steps = 0;
-  vec2 tgtOct = octEncode(rdir);
 
   for (int i = 0; i < 256; i++) {
     if (t >= dist) break;
     steps++;
     float sd;
     if (hires) {
-      sd = texture(uDistH, vec3(tgtOct, pi)).r;
-      float diff = t - sd;
-      if (diff > 0.10) return 0.0;
+      sd = texture(uDistH, vec3(uv, pi)).r;
+      if (t - sd + uDistBias > 0.10) return 0.0;
     } else {
-      sd = texture(uDistL, vec3(tgtOct, pi)).r;
-      float diff = t - sd;
-      if (diff > -0.15) { hires = true; step = 0.05; continue; }
+      sd = texture(uDistL, vec3(uv, pi)).r;
+      if (t - sd + uDistBias > -0.15) { hires = true; marchStep = 0.05; continue; }
     }
-    t += step;
+    t += marchStep;
   }
-  return vis0;
+  return vis;
+}
+
+vec3 skyCol(vec3 dir) {
+  float y = max(dir.y, 0.0);
+  return mix(vec3(0.7, 0.8, 0.9), vec3(0.2, 0.4, 0.85), y);
 }
 
 void main() {
@@ -224,7 +252,12 @@ void main() {
   vec3 N = normalize(texture(uNrm, vUV).xyz * 2.0 - 1.0);
   vec3 albedo = texture(uAlb, vUV).rgb;
 
-  if (length(P) < 0.001) { fColor = vec4(0); return; }
+  if (length(P) < 0.001) {
+    vec2 ndc = vUV * 2.0 - 1.0;
+    vec3 wDir = normalize(uCamFwd + ndc.x * uCamRight * uTanHalfFov * uAspect + ndc.y * uCamUp * uTanHalfFov);
+    fColor = vec4(skyCol(wDir), 1.0);
+    return;
+  }
 
   // Phase 1: output raw octahedral UV of surface normal
   if (uDebug == 1) {
@@ -253,69 +286,111 @@ void main() {
       fColor = vec4(vec3(d / 10.0), 1.0);
     } else {
       vec2 uv2 = vUV;
-      if (vUV.x < 0.5) {
-        uv2.x = vUV.x * 2.0;
-        vec3 irr = texture(uIrr, vec3(uv2, pi)).rgb;
-        fColor = vec4(irr, 1.0);
-      } else {
-        uv2.x = (vUV.x - 0.5) * 2.0;
-        float d = texture(uDistH, vec3(uv2, pi)).r;
-        fColor = vec4(vec3(d / 10.0), 1.0);
-      }
+      if (vUV.x < 0.5) { uv2.x = vUV.x * 2.0; vec3 irr = texture(uIrr, vec3(uv2, pi)).rgb; fColor = vec4(irr, 1.0); }
+      else { uv2.x = (vUV.x - 0.5) * 2.0; float d = texture(uDistH, vec3(uv2, pi)).r; fColor = vec4(vec3(d / 10.0), 1.0); }
     }
     return;
-  }
-
-  float w[8];
-  triW(P, uGMin, uGMax, w);
-
-  // Phase 4: single-probe mode
-  int probeStart = 0, probeEnd = NPROBES;
-  if (uSingleProbe >= 0 && uSingleProbe < NPROBES) {
-    probeStart = uSingleProbe;
-    probeEnd = uSingleProbe + 1;
-    for (int i = 0; i < NPROBES; i++) w[i] = 0.0;
-    w[uSingleProbe] = 1.0;
   }
 
   vec3 indirect = vec3(0.0);
   float tw = 0.0;
   vec2 nOct = octEncode(N);
-  int totalSteps = 0;
   int maxSteps = 0;
 
-  for (int i = probeStart; i < probeEnd; i++) {
-    if (w[i] < 0.001) continue;
-
-    vec3 Q = uProbePos[i];
-    vec3 dQ = normalize(Q - P);
-
-    // Backface test: max(0, n_surf · (p_probe - p_surf) / |p_probe - p_surf|)
-    float bf = max(0.0, dot(N, dQ));
-    if (bf < 0.001) continue;
-
-    // Visibility with self-intersection bias (offset P along N)
-    int steps;
-    float vis = probeVis(P + N * 0.05, Q, i, steps);
-    totalSteps += steps;
-    if (steps > maxSteps) maxSteps = steps;
-    if (vis < 0.001) continue;
-
-    vec3 irr = texture(uIrr, vec3(nOct, i)).rgb;
-    float weight = bf * vis * w[i];
-    indirect += irr * weight;
-    tw += weight;
+  // Phase 7: render with modifiers disabled (bf=1, vis=1) to isolate trilinear
+  if (uDebug == 7) {
+    int pi[8]; float pw[8];
+    getProbeSlice(P, pi, pw);
+    for (int j = 0; j < 8; j++) {
+      float weight = pw[j];
+      if (weight < 0.001) continue;
+      int i = pi[j];
+      vec3 irr = texture(uIrr, vec3(nOct, i)).rgb;
+      indirect += irr * weight; tw += weight;
+    }
+    if (tw > 0.0) indirect /= tw;
+    vec3 color = indirect * albedo;
+    fColor = vec4(color / (1.0 + color), 1.0);
+    return;
   }
 
-  // Phase 3: output step count as grayscale
+  vec3 indirectTri = vec3(0.0);
+  float twTri = 0.0;
+  float dbgBF = 0.0, dbgVis = 0.0;
+
+  if (uSingleProbe >= 0 && uSingleProbe < NPROBES) {
+    int i = uSingleProbe;
+    vec3 Q = uProbePos[i];
+    vec3 dQ = normalize(Q - P);
+    float bf = (dot(N, dQ) + 0.2) / 1.2;
+    bf = max(0.001, bf);
+    int steps;
+    float vis = probeVis(P + N * uNormalBias, Q, i, steps);
+    maxSteps = steps;
+    vis = max(0.001, vis);
+    vec3 irr = texture(uIrr, vec3(nOct, i)).rgb;
+    float w = bf * vis;
+    indirect += irr * w; tw += w;
+    indirectTri = irr; twTri = 1.0;
+    dbgBF = bf; dbgVis = vis;
+  } else {
+    int pi[8]; float pw[8];
+    getProbeSlice(P, pi, pw);
+    for (int j = 0; j < 8; j++) {
+      float weight = pw[j];
+      if (weight < 0.001) continue;
+      int i = pi[j];
+      vec3 Q = uProbePos[i];
+      vec3 dQ = normalize(Q - P);
+      float bf = (dot(N, dQ) + 0.2) / 1.2;
+      bf = max(0.001, bf);
+      int steps;
+      float vis = probeVis(P + N * uNormalBias, Q, i, steps);
+      if (steps > maxSteps) maxSteps = steps;
+      vis = max(0.001, vis);
+      vec3 irr = texture(uIrr, vec3(nOct, i)).rgb;
+      float w = bf * vis * weight;
+      indirect += irr * w; tw += w;
+      indirectTri += irr * weight; twTri += weight;
+      dbgBF += bf * weight; dbgVis += vis * weight;
+    }
+  }
+
   if (uDebug == 3) {
     float s = float(maxSteps) / 256.0;
     fColor = vec4(vec3(s), 1.0);
     return;
   }
 
-  if (tw > 0.0) indirect /= tw;
-  vec3 color = indirect * albedo;
+  // Phase 8: debug total weight (tw as grayscale)
+  if (uDebug == 8) {
+    fColor = vec4(vec3(tw), 1.0);
+    return;
+  }
+
+  // Phase 9: debug backface weight (bf weighted by trilinear)
+  if (uDebug == 9) {
+    fColor = vec4(vec3(dbgBF), 1.0);
+    return;
+  }
+
+  // Phase 10: debug visibility weight (vis weighted by trilinear)
+  if (uDebug == 10) {
+    fColor = vec4(vec3(dbgVis), 1.0);
+    return;
+  }
+
+  if (tw < 0.0001) {
+    indirect = (twTri > 0.0) ? (indirectTri / twTri) : vec3(0.0);
+  } else {
+    indirect /= tw;
+  }
+  vec3 L = normalize(uLightPos - P);
+  float NdotL = max(0.0, dot(N, L));
+  float distL = length(uLightPos - P);
+  float atten = 1.0 / (1.0 + distL * distL * 0.1);
+  vec3 direct = uLightCol * NdotL * atten;
+  vec3 color = (indirect + direct) * albedo;
   fColor = vec4(color / (1.0 + color), 1.0);
 }
 `;
